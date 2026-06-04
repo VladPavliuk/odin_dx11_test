@@ -16,6 +16,8 @@ foreign user32 {
 @(default_calling_convention = "std")
 foreign shell32 {
     SHCreateItemFromParsingName :: proc(win32.PCWSTR, ^win32.IBindCtx, win32.REFIID, rawptr) -> win32.HRESULT ---
+    ILCreateFromPathW :: proc(pszPath: win32.PCWSTR) -> rawptr ---
+    SHOpenFolderAndSelectItems :: proc(pidlFolder: rawptr, cidl: win32.UINT, apidl: ^rawptr, dwFlags: win32.DWORD) -> win32.HRESULT ---
 }
 
 WIN32_OBJID_MENU :: 0xFFFFFFFD

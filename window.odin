@@ -131,8 +131,8 @@ createWindow :: proc(size: int2) {
     hInstance := win32.HINSTANCE(win32.GetModuleHandleA(nil))
     
     wndClassName := win32.utf8_to_wstring("class")
-    
-    resourceIcon := win32.LoadImageW(hInstance, win32.MAKEINTRESOURCEW(IDI_ICON), 
+
+    resourceIcon := win32.LoadImageW(hInstance, win32.LPCWSTR(win32.MAKEINTRESOURCEW(IDI_ICON)),
         win32.IMAGE_ICON, 256, 256, win32.LR_DEFAULTCOLOR)
 
     defaultCursor = win32.LoadCursorA(nil, win32.IDC_ARROW)
@@ -156,7 +156,6 @@ createWindow :: proc(size: int2) {
     // TODO: is it good approach?
     win32.SetProcessDpiAwarenessContext(win32.DPI_AWARENESS_CONTEXT_SYSTEM_AWARE)
     
-    // TODO: it won't work with utf-16 symbols in the title
     windowTitle := "Editor"
     
     // rect: win32.RECT = {0, 0, size.x, size.y}
@@ -165,7 +164,7 @@ createWindow :: proc(size: int2) {
     hwnd := win32.CreateWindowExW(
         0,
         wndClassName,
-        cast([^]u16)raw_data(windowTitle),
+        win32.utf8_to_wstring(windowTitle),
         win32.WS_OVERLAPPEDWINDOW | win32.CS_DBLCLKS,
         win32.CW_USEDEFAULT, win32.CW_USEDEFAULT, 
         size.x, size.y,

@@ -476,11 +476,11 @@ renderFolderExplorer :: proc() {
         }); .SUBMIT in actions {
             item := openedItems[itemContextMenuIndex]
 
-            pidl := win32.ILCreateFromPathW(win32.utf8_to_wstring(item.fullPath))
+            pidl := ILCreateFromPathW(win32.utf8_to_wstring(item.fullPath))
             defer win32.CoTaskMemFree(pidl)
             assert(pidl != nil)
 
-            hr := win32.SHOpenFolderAndSelectItems(pidl, 0, nil, 0)
+            hr := SHOpenFolderAndSelectItems(pidl, 0, nil, 0)
             assert(hr == 0)
 
             showFileContextMenu = false

@@ -117,7 +117,7 @@ winProc :: proc "system" (hwnd: win32.HWND, msg: win32.UINT, wParam: win32.WPARA
         for i in 0..<fileCount {
             // Get the path of the file
             win32.DragQueryFileW(hDrop, i, raw_data(filePathBuffer[:]), MAX_PATH);
-            filePath, err := win32.wstring_to_utf8(raw_data(filePathBuffer[:]), MAX_PATH)
+            filePath, err := win32.wstring_to_utf8(win32.wstring(raw_data(filePathBuffer[:])), MAX_PATH)
             assert(err == nil)
             loadFileIntoNewTab(filePath)
         }

@@ -18,6 +18,7 @@ foreign kernel32 {
     WaitForDebugEvent :: proc(lpDebugEvent: ^WIN32_DEBUG_EVENT, dwMilliseconds: win32.DWORD) -> win32.BOOL ---
     ContinueDebugEvent :: proc(dwProcessId: win32.DWORD, dwThreadId: win32.DWORD, dwContinueStatus: win32.DWORD) -> win32.BOOL ---
     GetThreadId :: proc(Thread: win32.HANDLE) -> win32.DWORD ---
+    FlushInstructionCache :: proc(hProcess: win32.HANDLE, lpBaseAddress: win32.LPCVOID, dwSize: win32.SIZE_T) -> win32.BOOL ---
 }
 
 @(default_calling_convention = "std")
@@ -80,8 +81,8 @@ applyBreakpoint :: proc(process: win32.HANDLE, address: uintptr, appliedBreakpoi
     res = win32.WriteProcessMemory(process, win32.LPCVOID(address), &breakpointInstruction, 1, &bytesWritten)
     assert(res == true && bytesWritten == 1)
 
-    res = win32.FlushInstructionCache(process, win32.LPCVOID(address), 1);
-    assert(res == true)
+    // res = win32.FlushInstructionCache(process, win32.LPCVOID(address), 1);
+    // assert(res == true)
 
     appliedBreakpoints[address] = originalByte
 }
@@ -94,7 +95,7 @@ removeBreakpoint :: proc(process: win32.HANDLE, breakpointAddress: uintptr, appl
     res := win32.WriteProcessMemory(process, win32.LPCVOID(breakpointAddress), &originalByte, 1, &bytesWritten)
     assert(res == true && bytesWritten == 1)
 
-    res = win32.FlushInstructionCache(process, win32.LPCVOID(breakpointAddress), 1);
+    res = FlushInstructionCache(process, win32.LPCVOID(breakpointAddress), 1);
     assert(res == true)
 
     delete_key(appliedBreakpoints, breakpointAddress)
@@ -258,7 +259,7 @@ runDebugProcess_Function :: proc(exePath: string) {
             exe.address = exeBasePointer
 
             exeBaseAddress = exeBasePointer 
-            nameLength := win32.GetFinalPathNameByHandleW(debugEvent.u.CreateProcessInfo.hFile, raw_data(exeNameBuffer[:]), exeNameBufferLength, 0)
+            nameLength := win32.GetFinalPathNameByHandleW(debugEvent.u.CreateProcessInfo.hFile, win32.wstring(raw_data(exeNameBuffer[:])), exeNameBufferLength, 0)
             exeName, err := win32.wstring_to_utf8(win32.wstring(raw_data(exeNameBuffer[:])), int(nameLength))
             exe.name = strings.clone(exeName)
 
@@ -471,7 +472,7 @@ runDebugProcess_Function :: proc(exePath: string) {
                 isWide := debugEvent.u.LoadDll.fUnicode != 0
                 
                 if isWide {
-                    dllName, _ = win32.wstring_to_utf8(win32.wstring(raw_data(dllNameBuffer[:])), int(read))
+                    dllName, _ = win32.wstring_to_utf8(transmute(win32.wstring)raw_data(dllNameBuffer[:]), int(read))
                     // fmt.printfln("Load DLL: %s (%#X)", dllName, debugEvent.u.LoadDll.lpBaseOfDll)
                 } else {
                     dllName = string(dllNameBuffer[:])
@@ -590,7 +591,7 @@ runDebugProcess_Function :: proc(exePath: string) {
             win32.ReadProcessMemory(processInfo.hProcess, debugEvent.u.DebugString.lpDebugStringData, raw_data(test[:]), length, &read)
             
             if isWide {
-                fmt.println(win32.wstring_to_utf8(win32.wstring(raw_data(test[:])), int(length)))
+                fmt.println(win32.wstring_to_utf8(transmute(win32.wstring)raw_data(test[:]), int(length)))
             } else {
                 fmt.println(string(test))
             }
@@ -875,7 +876,7 @@ test :: proc() {
 
         GetModuleBaseNameW(processHandle, hMod, raw_data(test[:]), 255)
 
-        fmt.println(win32.wstring_to_utf8(raw_data(test[:]), 255))
+        fmt.println(win32.wstring_to_utf8(win32.wstring(raw_data(test[:])), 255))
     }
     
     // win32.Deb

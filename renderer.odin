@@ -710,7 +710,7 @@ renderLineNumbers :: proc() {
     for lineNumber in firstNumber..=lastNumber {
         lineNumberStrBuffer := new([255]byte, context.temp_allocator)
 
-        lineNumberStr := strconv.itoa(lineNumberStrBuffer[:], int(lineNumber))
+        lineNumberStr := strconv.write_int(lineNumberStrBuffer[:], i64(lineNumber), 10)
 
         leftOffset := -f32(windowData.size.x) / 2.0 + f32(lineNumbersLeftOffset)
 

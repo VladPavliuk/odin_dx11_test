@@ -169,7 +169,7 @@ showSaveAsFileDialog :: proc(tab: ^FileTab) -> (success: bool) {
     shellItem->GetDisplayName(win32.SIGDN.FILESYSPATH, &filePathW)
     defer win32.CoTaskMemFree(filePathW)
 
-    filePath, _ := win32.wstring_to_utf8(filePathW, -1)
+    filePath, _ := win32.wstring_to_utf8(win32.wstring(filePathW), -1)
 
     delete(tab.name)
     delete(tab.filePath)
