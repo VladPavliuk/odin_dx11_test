@@ -24,6 +24,20 @@
                 // "-sanitize:memory",
                 // "-sanitize:thread",
            ]
+        },
+        {
+           "label": "odin build cmd-debugger",
+           "type": "process",
+           "command": "odin",
+           "args": [
+                "build",
+                ".",
+                "-debug",
+                "-define:CMD_DEBUGGER=true",
+                "-out:bin/cmd_debugger.exe",
+                "-subsystem:console",
+                "-resource:resources/resource.rc",
+           ]
         }
     ]
 }

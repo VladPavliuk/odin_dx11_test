@@ -194,6 +194,7 @@ EditorState :: struct {
     fileTabs: [dynamic]SavedFileTab,
     activeTabIndex: int,
     openedFolder: string,
+    debuggerExePath: string,
 }
 
 saveEditorState :: proc() {
@@ -205,6 +206,7 @@ saveEditorState :: proc() {
     }
 
     state.activeTabIndex = windowData.activeTabIndex
+    state.debuggerExePath = windowData.debuggerExePath
 
     // TODO: save only text copies of files that are relativelly small (less then 2k symbols)
     for tab in windowData.fileTabs {
@@ -264,6 +266,10 @@ applyEditorState :: proc() -> bool {
     }
 
     windowData.activeTabIndex = state.activeTabIndex
+
+    if len(state.debuggerExePath) > 0 {
+        windowData.debuggerExePath = strings.clone(state.debuggerExePath)
+    }
 
     return true
 }

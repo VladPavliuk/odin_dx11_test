@@ -1,6 +1,8 @@
 package main
 import win32 "core:sys/windows"
 import "core:strings"
+import "core:os"
+import "core:path/filepath"
 
 // foreign import msdia140 "system:diaguids.lib"
 
@@ -371,30 +373,135 @@ PdbData :: struct {
 
 }
 
-initPdbData :: proc(pdbFilePath: string) -> PdbData {
+// Minimal IClassFactory binding so we can create the DIA data source straight from msdia140.dll
+// without it being registered with regsvr32 (registration-free COM).
+IClassFactory_UUID := &win32.IID{0x00000001, 0x0000, 0x0000, {0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}}
+IClassFactory :: struct #raw_union {
+    #subtype iunknown: win32.IUnknown,
+    using iclassfactory_vtable: ^IClassFactory_VTable,
+}
+IClassFactory_VTable :: struct {
+    using iunknown_vtable: win32.IUnknown_VTable,
+    CreateInstance: proc "system" (this: ^IClassFactory, pUnkOuter: ^win32.IUnknown, riid: win32.REFIID, ppvObject: ^rawptr) -> win32.HRESULT,
+    LockServer:     proc "system" (this: ^IClassFactory, fLock: win32.BOOL) -> win32.HRESULT,
+}
+
+DllGetClassObjectProc :: #type proc "system" (rclsid: win32.REFCLSID, riid: win32.REFIID, ppv: ^rawptr) -> win32.HRESULT
+
+// Locates msdia140.dll inside a Visual Studio installation so we can load it at runtime instead
+// of requiring it to be registered or copied next to the editor. Returns the full path.
+findMsdiaDll :: proc() -> (string, bool) {
+    diaSubPath :: "DIA SDK\\bin\\amd64\\msdia140.dll" // amd64 because the editor is a 64-bit process
+
+    // 1. The VS developer environment variable, if the editor was launched from a dev prompt.
+    if vsDir := os.get_env("VSINSTALLDIR", context.temp_allocator); vsDir != "" {
+        candidate := fmt.tprintf("%s\\%s", strings.trim_suffix(vsDir, "\\"), diaSubPath)
+        if os.exists(candidate) { return candidate, true }
+    }
+
+    roots := []string{
+        "C:\\Program Files\\Microsoft Visual Studio",
+        "C:\\Program Files (x86)\\Microsoft Visual Studio",
+    }
+
+    // 2. Standard install locations (cheap, exact os.exists checks).
+    years := []string{ "2026", "2022", "2019", "2017" }
+    editions := []string{ "Community", "Professional", "Enterprise", "Preview", "BuildTools" }
+    for root in roots {
+        for year in years {
+            for edition in editions {
+                candidate := fmt.tprintf("%s\\%s\\%s\\%s", root, year, edition, diaSubPath)
+                if os.exists(candidate) { return candidate, true }
+            }
+        }
+    }
+
+    // 3. Catch-all for any other year/edition via globbing.
+    for root in roots {
+        pattern := fmt.tprintf("%s\\*\\*\\%s", root, diaSubPath)
+        if matches, err := filepath.glob(pattern, context.temp_allocator); err == .None && len(matches) > 0 {
+            return matches[0], true
+        }
+    }
+
+    return "", false
+}
+
+// Creates an IDiaDataSource by loading msdia140.dll directly, so the editor works even when the
+// dll hasn't been registered. Tries PATH/app dir first, then the Visual Studio installation.
+createDiaDataSourceRegFree :: proc() -> (^IDiaDataSource, bool) {
+    hModule := win32.LoadLibraryW(win32.utf8_to_wstring("msdia140.dll"))
+    if hModule == nil {
+        if dllPath, found := findMsdiaDll(); found {
+            fmt.println("Loading DIA from:", dllPath)
+            hModule = win32.LoadLibraryW(win32.utf8_to_wstring(dllPath))
+        }
+    }
+    if hModule == nil { return nil, false }
+
+    getClassObjectAddr := win32.GetProcAddress(hModule, "DllGetClassObject")
+    if getClassObjectAddr == nil { return nil, false }
+    dllGetClassObject := cast(DllGetClassObjectProc)getClassObjectAddr
+
+    classFactory: ^IClassFactory
+    hr := dllGetClassObject(DiaSource_UUID, IClassFactory_UUID, cast(^rawptr)(&classFactory))
+    if hr != 0 || classFactory == nil { return nil, false }
+    defer classFactory->Release()
+
+    dataSource: ^IDiaDataSource
+    hr = classFactory->CreateInstance(nil, IDiaDataSource_UUID, cast(^rawptr)(&dataSource))
+    if hr != 0 { return nil, false }
+
+    return dataSource, true
+}
+
+initPdbData :: proc(pdbFilePath: string) -> (PdbData, bool) {
     dataSource: ^IDiaDataSource
     win32.CoInitialize(nil)
     // NOTE: if it can't find dll it will return 14007 error, to fix it run regsvr32 <path_to_msdia140.dll>
     hr := win32.CoCreateInstance(DiaSource_UUID, nil, win32.CLSCTX_INPROC_SERVER, IDiaDataSource_UUID, cast(^win32.LPVOID)(&dataSource))
-    assert(hr == 0)
-    // defer dataSource->Release();
+    if hr != 0 {
+        // msdia140.dll isn't registered - fall back to loading it directly.
+        regFreeSource, ok := createDiaDataSourceRegFree()
+        if !ok {
+            fmt.printfln("DIA: could not create data source (CoCreateInstance: %#X). Either run 'regsvr32 msdia140.dll' (elevated) or copy msdia140.dll next to the editor exe.", u32(hr))
+            return {}, false
+        }
+        dataSource = regFreeSource
+    }
 
     path := win32.utf8_to_wstring(pdbFilePath)
     hr = dataSource->loadDataFromPdb(transmute(win32.LPCOLESTR)(path))
-    assert(hr == 0)
+    if hr != 0 {
+        lastError: win32.BSTR
+        dataSource->get_lastError(&lastError)
+        errText, _ := win32.wstring_to_utf8(win32.wstring(lastError), -1)
+        fmt.printfln("DIA: loadDataFromPdb('%s') failed: %#X (%s)", pdbFilePath, u32(hr), errText)
+        dataSource->Release()
+        return {}, false
+    }
 
     dataSession: ^IDiaSession
     hr = dataSource->openSession(&dataSession)
-    assert(hr == 0)
+    if hr != 0 {
+        fmt.printfln("DIA: openSession failed: %#X", u32(hr))
+        dataSource->Release()
+        return {}, false
+    }
 
     pGlobal: ^IDiaSymbol
     hr = dataSession->get_globalScope(&pGlobal)
-    assert(hr == 0)
+    if hr != 0 {
+        fmt.printfln("DIA: get_globalScope failed: %#X", u32(hr))
+        dataSession->Release()
+        dataSource->Release()
+        return {}, false
+    }
 
     return PdbData{
         session = dataSession,
-        globalSymbol = pGlobal   
-    }
+        globalSymbol = pGlobal
+    }, true
 }
 
 getFunctionNameByRVA :: proc(session: ^IDiaSession, rva: u32) -> (string, bool) {
@@ -420,13 +527,12 @@ getRVABySourcePosition :: proc(session: ^IDiaSession, filePath: string, line: i3
 
     pEnumSourceFiles: ^IDiaEnumSourceFiles
     hr := session->findFile(nil, transmute(win32.LPCOLESTR)filePathWide, u32(NameSearchOptions.nsCaseInsensitive), &pEnumSourceFiles)
-    assert(hr == 0)
+    if hr != 0 { return 0 } // file is not part of this module's pdb
     defer pEnumSourceFiles->Release()
 
     foundFilesCount: i32
     hr = pEnumSourceFiles->get_Count(&foundFilesCount)
-    assert(hr == 0)
-    assert(foundFilesCount > 0, "source file not found")
+    if hr != 0 || foundFilesCount <= 0 { return 0 }
     
     lineRVA: u32
     celt: win32.ULONG
@@ -486,6 +592,9 @@ getRVABySourcePosition :: proc(session: ^IDiaSession, filePath: string, line: i3
 getSourcePositionByRVA :: proc(session: ^IDiaSession, rva: u32) -> (string, u32, u32, u32) {
     pLines: ^IDiaEnumLineNumbers
     hr := session->findLinesByRVA(rva, 1, &pLines)
+    // findLinesByRVA fails (leaving pLines nil) for any RVA not in this pdb, e.g. an address in a
+    // system DLL while single-stepping. Guard it - dereferencing pLines below would crash.
+    if hr != 0 || pLines == nil { return "", 0, 0, 0 }
     defer pLines->Release()
 
     pLine: ^IDiaLineNumber

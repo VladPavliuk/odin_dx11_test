@@ -6,7 +6,17 @@ import "core:mem"
 import "core:thread"
 import win32 "core:sys/windows"
 
+// Entry point. Two front-ends share the same debugger core: the normal editor (GUI) and a
+// headless command-line debugger selected at build time with `-define:CMD_DEBUGGER=true`.
 main :: proc() {
+    when #config(CMD_DEBUGGER, false) {
+        runCmdDebugger()
+    } else {
+        runEditor()
+    }
+}
+
+runEditor :: proc() {
     when ODIN_DEBUG {
         tracker: mem.Tracking_Allocator
         mem.tracking_allocator_init(&tracker, context.allocator)
@@ -48,11 +58,18 @@ main :: proc() {
         }
 
         if .F5 in inputState.wasPressedKeys {
-            runDebugThread("C:\\projects\\cpp_test_cmd\\x64\\Debug\\cpp_test_cmd.exe")
+            // re-run the last exe configured via the Run dialog
+            if windowData.debuggerExePath != "" {
+                runDebugThread(windowData.debuggerExePath)
+            }
+        }
+
+        if .F10 in inputState.wasPressedKeys {
+            windowData.debuggerCommand = .STEP_OVER
         }
 
         if .F11 in inputState.wasPressedKeys {
-            windowData.debuggerCommand = .STEP
+            windowData.debuggerCommand = .STEP_INTO
         }
 
         // NOTE: For some reasons if mouse double click on laptop touchpad happened, windows sends WM_LBUTTONDOWN and WM_LBUTTONUP at the same time??!

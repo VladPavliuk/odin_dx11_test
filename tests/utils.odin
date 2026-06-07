@@ -9,18 +9,11 @@ import "core:log"
 
 import win32 "core:sys/windows"
 
-foreign import user32 "system:user32.lib"
-
 WIN32_CWPSTRUCT :: struct {
     lParam: win32.LPARAM,
     wParam: win32.WPARAM,
     message: win32.UINT,
     hwnd: win32.HWND,
-}
-
-@(default_calling_convention = "std")
-foreign user32 {
-    @(link_name="GetWindowThreadProcessId") GetWindowThreadProcessId :: proc(win32.HWND, win32.LPDWORD) ---
 }
 
 import main "../"
@@ -127,6 +120,61 @@ clickCtrlF :: proc() {
 
     emulateKey(win32.VK_CONTROL, false)
     emulateKey(0x46, false) // F
+}
+
+// press and release a single key (arrows, backspace, delete, home, end, tab, etc.)
+clickKey :: proc(key: i32) {
+    emulateKey(key, true)
+    time.sleep(10_000_000) // if it's less then 1ms, then it seems it's iggnored?
+    emulateKey(key, false)
+    time.sleep(10_000_000)
+}
+
+clickKeyTimes :: proc(key: i32, times: int) {
+    for _ in 0..<times {
+        clickKey(key)
+    }
+}
+
+// press a key while holding CTRL (e.g. Ctrl+A, Ctrl+Z, Ctrl+N)
+clickCtrlKey :: proc(key: i32) {
+    emulateKey(win32.VK_CONTROL, true)
+    emulateKey(key, true)
+
+    time.sleep(10_000_000) // if it's less then 1ms, then it seems it's iggnored?
+
+    emulateKey(key, false)
+    emulateKey(win32.VK_CONTROL, false)
+
+    time.sleep(10_000_000)
+}
+
+// press a key while holding CTRL+SHIFT (e.g. Ctrl+Shift+Z for redo)
+clickCtrlShiftKey :: proc(key: i32) {
+    emulateKey(win32.VK_CONTROL, true)
+    emulateKey(win32.VK_SHIFT, true)
+    emulateKey(key, true)
+
+    time.sleep(10_000_000) // if it's less then 1ms, then it seems it's iggnored?
+
+    emulateKey(key, false)
+    emulateKey(win32.VK_SHIFT, false)
+    emulateKey(win32.VK_CONTROL, false)
+
+    time.sleep(10_000_000)
+}
+
+// press a key while holding SHIFT (e.g. Shift+Left to extend the selection)
+clickShiftKey :: proc(key: i32) {
+    emulateKey(win32.VK_SHIFT, true)
+    emulateKey(key, true)
+
+    time.sleep(10_000_000) // if it's less then 1ms, then it seems it's iggnored?
+
+    emulateKey(key, false)
+    emulateKey(win32.VK_SHIFT, false)
+
+    time.sleep(10_000_000)
 }
 
 clickMouse :: proc{clickMouse_Single, clickMouse_Multiple}

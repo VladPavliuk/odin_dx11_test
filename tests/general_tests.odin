@@ -125,3 +125,293 @@ just_run_wait_and_close :: proc(t: ^testing.T) {
 
     time.sleep(5_000_000_000)
 }
+
+@(test)
+type_and_backspace :: proc(t: ^testing.T) {
+    os.remove(main.editorStateFilePath)
+
+    appThread, windowData := startApp(proc(windowData: ^main.WindowData) -> bool {
+        return windowData.windowCreated
+    })
+    defer stopApp(appThread, windowData.parentHwnd)
+
+    typeStringOnKeyboard(windowData.parentHwnd, "hello world")
+
+    // remove the trailing "world" (5 characters)
+    clickKeyTimes(win32.VK_BACK, 5)
+    time.sleep(100_000_000)
+
+    testing.expect_value(t, strings.to_string(main.getActiveTabContext().text), "hello ")
+}
+
+@(test)
+type_multiple_lines :: proc(t: ^testing.T) {
+    os.remove(main.editorStateFilePath)
+
+    appThread, windowData := startApp(proc(windowData: ^main.WindowData) -> bool {
+        return windowData.windowCreated
+    })
+    defer stopApp(appThread, windowData.parentHwnd)
+
+    typeStringOnKeyboard(windowData.parentHwnd, "line one")
+    clickEnter()
+    typeStringOnKeyboard(windowData.parentHwnd, "line two")
+    time.sleep(100_000_000)
+
+    ctx := main.getActiveTabContext()
+    testing.expect_value(t, strings.to_string(ctx.text), "line one\nline two")
+    testing.expect_value(t, len(ctx.lines), 2)
+}
+
+@(test)
+select_all_and_delete :: proc(t: ^testing.T) {
+    os.remove(main.editorStateFilePath)
+
+    appThread, windowData := startApp(proc(windowData: ^main.WindowData) -> bool {
+        return windowData.windowCreated
+    })
+    defer stopApp(appThread, windowData.parentHwnd)
+
+    typeStringOnKeyboard(windowData.parentHwnd, "delete me please")
+
+    clickCtrlKey(win32.VK_A) // select all
+    clickKey(win32.VK_BACK)  // delete the whole selection
+    time.sleep(100_000_000)
+
+    testing.expect_value(t, strings.to_string(main.getActiveTabContext().text), "")
+}
+
+@(test)
+cursor_home_and_end :: proc(t: ^testing.T) {
+    os.remove(main.editorStateFilePath)
+
+    appThread, windowData := startApp(proc(windowData: ^main.WindowData) -> bool {
+        return windowData.windowCreated
+    })
+    defer stopApp(appThread, windowData.parentHwnd)
+
+    typeStringOnKeyboard(windowData.parentHwnd, "abcdef")
+
+    clickKey(win32.VK_HOME)
+    time.sleep(50_000_000)
+    testing.expect_value(t, main.getActiveTabContext().editorState.selection[0], 0)
+
+    clickKey(win32.VK_END)
+    time.sleep(50_000_000)
+    testing.expect_value(t, main.getActiveTabContext().editorState.selection[0], 6)
+}
+
+@(test)
+arrow_left_right_navigation :: proc(t: ^testing.T) {
+    os.remove(main.editorStateFilePath)
+
+    appThread, windowData := startApp(proc(windowData: ^main.WindowData) -> bool {
+        return windowData.windowCreated
+    })
+    defer stopApp(appThread, windowData.parentHwnd)
+
+    typeStringOnKeyboard(windowData.parentHwnd, "abc") // cursor ends at index 3
+
+    clickKey(win32.VK_LEFT)
+    time.sleep(50_000_000)
+    testing.expect_value(t, main.getActiveTabContext().editorState.selection[0], 2)
+
+    clickKey(win32.VK_LEFT)
+    time.sleep(50_000_000)
+    testing.expect_value(t, main.getActiveTabContext().editorState.selection[0], 1)
+
+    clickKey(win32.VK_RIGHT)
+    time.sleep(50_000_000)
+    testing.expect_value(t, main.getActiveTabContext().editorState.selection[0], 2)
+}
+
+@(test)
+word_navigation :: proc(t: ^testing.T) {
+    os.remove(main.editorStateFilePath)
+
+    appThread, windowData := startApp(proc(windowData: ^main.WindowData) -> bool {
+        return windowData.windowCreated
+    })
+    defer stopApp(appThread, windowData.parentHwnd)
+
+    typeStringOnKeyboard(windowData.parentHwnd, "hello world foo") // cursor ends at index 15
+
+    clickCtrlKey(win32.VK_LEFT) // jump to start of "foo" (index 12)
+    time.sleep(50_000_000)
+    testing.expect_value(t, main.getActiveTabContext().editorState.selection[0], 12)
+
+    clickCtrlKey(win32.VK_LEFT) // jump to start of "world" (index 6)
+    time.sleep(50_000_000)
+    testing.expect_value(t, main.getActiveTabContext().editorState.selection[0], 6)
+}
+
+@(test)
+delete_word_left :: proc(t: ^testing.T) {
+    os.remove(main.editorStateFilePath)
+
+    appThread, windowData := startApp(proc(windowData: ^main.WindowData) -> bool {
+        return windowData.windowCreated
+    })
+    defer stopApp(appThread, windowData.parentHwnd)
+
+    typeStringOnKeyboard(windowData.parentHwnd, "hello world")
+
+    clickCtrlKey(win32.VK_BACK) // delete the word to the left of the cursor ("world")
+    time.sleep(100_000_000)
+
+    testing.expect_value(t, strings.to_string(main.getActiveTabContext().text), "hello ")
+}
+
+@(test)
+delete_word_right :: proc(t: ^testing.T) {
+    os.remove(main.editorStateFilePath)
+
+    appThread, windowData := startApp(proc(windowData: ^main.WindowData) -> bool {
+        return windowData.windowCreated
+    })
+    defer stopApp(appThread, windowData.parentHwnd)
+
+    typeStringOnKeyboard(windowData.parentHwnd, "hello world")
+
+    clickKey(win32.VK_HOME)       // move the cursor to the start of the line
+    clickCtrlKey(win32.VK_DELETE) // delete the word to the right ("hello ")
+    time.sleep(100_000_000)
+
+    testing.expect_value(t, strings.to_string(main.getActiveTabContext().text), "world")
+}
+
+@(test)
+select_to_line_start_and_delete :: proc(t: ^testing.T) {
+    os.remove(main.editorStateFilePath)
+
+    appThread, windowData := startApp(proc(windowData: ^main.WindowData) -> bool {
+        return windowData.windowCreated
+    })
+    defer stopApp(appThread, windowData.parentHwnd)
+
+    typeStringOnKeyboard(windowData.parentHwnd, "first")
+    clickEnter()
+    typeStringOnKeyboard(windowData.parentHwnd, "second")
+
+    clickShiftKey(win32.VK_HOME) // select "second" (from cursor back to line start)
+    clickKey(win32.VK_BACK)      // delete the selected text
+    time.sleep(100_000_000)
+
+    testing.expect_value(t, strings.to_string(main.getActiveTabContext().text), "first\n")
+}
+
+@(test)
+select_left_and_replace :: proc(t: ^testing.T) {
+    os.remove(main.editorStateFilePath)
+
+    appThread, windowData := startApp(proc(windowData: ^main.WindowData) -> bool {
+        return windowData.windowCreated
+    })
+    defer stopApp(appThread, windowData.parentHwnd)
+
+    typeStringOnKeyboard(windowData.parentHwnd, "abcd")
+
+    clickShiftKey(win32.VK_LEFT) // select "d"
+    clickShiftKey(win32.VK_LEFT) // extend selection to "cd"
+
+    typeStringOnKeyboard(windowData.parentHwnd, "z") // typing replaces the selection
+    time.sleep(100_000_000)
+
+    testing.expect_value(t, strings.to_string(main.getActiveTabContext().text), "abz")
+}
+
+@(test)
+tab_inserts_tab_character :: proc(t: ^testing.T) {
+    os.remove(main.editorStateFilePath)
+
+    appThread, windowData := startApp(proc(windowData: ^main.WindowData) -> bool {
+        return windowData.windowCreated
+    })
+    defer stopApp(appThread, windowData.parentHwnd)
+
+    typeStringOnKeyboard(windowData.parentHwnd, "ab")
+    clickKey(win32.VK_TAB)
+    typeStringOnKeyboard(windowData.parentHwnd, "cd")
+    time.sleep(100_000_000)
+
+    testing.expect_value(t, strings.to_string(main.getActiveTabContext().text), "ab\tcd")
+}
+
+@(test)
+new_line_preserves_indentation :: proc(t: ^testing.T) {
+    os.remove(main.editorStateFilePath)
+
+    appThread, windowData := startApp(proc(windowData: ^main.WindowData) -> bool {
+        return windowData.windowCreated
+    })
+    defer stopApp(appThread, windowData.parentHwnd)
+
+    // leading whitespace on the current line should be copied to the new line
+    typeStringOnKeyboard(windowData.parentHwnd, "  hi")
+    clickEnter()
+    typeStringOnKeyboard(windowData.parentHwnd, "x")
+    time.sleep(100_000_000)
+
+    testing.expect_value(t, strings.to_string(main.getActiveTabContext().text), "  hi\n  x")
+}
+
+@(test)
+undo_and_redo :: proc(t: ^testing.T) {
+    os.remove(main.editorStateFilePath)
+
+    appThread, windowData := startApp(proc(windowData: ^main.WindowData) -> bool {
+        return windowData.windowCreated
+    })
+    defer stopApp(appThread, windowData.parentHwnd)
+
+    typeStringOnKeyboard(windowData.parentHwnd, "abc")
+
+    // wait longer than the undo grouping timeout (300ms) so the next edit starts a fresh undo step
+    time.sleep(400_000_000)
+
+    typeStringOnKeyboard(windowData.parentHwnd, "def")
+
+    clickCtrlKey(win32.VK_Z) // undo "def"
+    time.sleep(100_000_000)
+    testing.expect_value(t, strings.to_string(main.getActiveTabContext().text), "abc")
+
+    clickCtrlShiftKey(win32.VK_Z) // redo "def"
+    time.sleep(100_000_000)
+    testing.expect_value(t, strings.to_string(main.getActiveTabContext().text), "abcdef")
+}
+
+@(test)
+new_empty_tab_increases_count :: proc(t: ^testing.T) {
+    os.remove(main.editorStateFilePath)
+
+    appThread, windowData := startApp(proc(windowData: ^main.WindowData) -> bool {
+        return windowData.windowCreated
+    })
+    defer stopApp(appThread, windowData.parentHwnd)
+
+    initialCount := len(windowData.fileTabs)
+
+    clickCtrlKey(win32.VK_N) // open a new empty tab
+    time.sleep(100_000_000)
+
+    testing.expect_value(t, len(windowData.fileTabs), initialCount + 1)
+}
+
+@(test)
+switch_between_tabs :: proc(t: ^testing.T) {
+    os.remove(main.editorStateFilePath)
+
+    appThread, windowData := startApp(proc(windowData: ^main.WindowData) -> bool {
+        return windowData.windowCreated
+    })
+    defer stopApp(appThread, windowData.parentHwnd)
+
+    clickCtrlKey(win32.VK_N) // add a second tab, which becomes the active one
+    time.sleep(100_000_000)
+    secondTabIndex := windowData.activeTabIndex
+
+    clickCtrlKey(win32.VK_TAB) // cycle to the next tab
+    time.sleep(100_000_000)
+
+    testing.expect(t, windowData.activeTabIndex != secondTabIndex, "active tab should change after Ctrl+Tab")
+}

@@ -40,12 +40,48 @@ TRAP_FLAG :: 1 << 8;
 DebuggerCommand :: enum {
     NONE,
     CONTINUE,
-    READ,
-    STOP,
-    STEP,
+    STEP_OVER, // run the current source line, stepping over calls
+    STEP_INTO, // advance one source line, descending into calls that have source info
+}
+
+// How a source-level step is currently progressing on the debug thread (driven by the stepping
+// engine in the debug loop). None means we're not stepping.
+StepMode :: enum {
+    None,
+    Over,
+    Into,
 }
 
 SingleBrakepoint :: struct {
+    filePath: string,
+    line: i32,
+}
+
+// A local variable / parameter snapshot taken while the debuggee is paused.
+DebuggerVariable :: struct {
+    name: string,
+    value: string,
+}
+
+ExportFunction :: struct {
+    name: string,
+    address: uintptr,
+}
+
+// A module (the exe or a loaded DLL) discovered while debugging, together with whatever symbol
+// sources we found for it. Used for address->symbol resolution, e.g. building a call stack.
+DebuggerModule :: struct {
+    name: string,
+    address: uintptr,
+    size: i32,
+    pdbFiles: [dynamic]PdbData,
+    exportFunctions: [dynamic]ExportFunction,
+}
+
+// A single resolved call-stack frame captured while the debuggee is paused. Both strings are
+// owned (freed by freeDebuggerCallStackContents); filePath is "" when there's no source mapping.
+DebuggerStackFrame :: struct {
+    function: string,
     filePath: string,
     line: i32,
 }
@@ -101,6 +137,18 @@ removeBreakpoint :: proc(process: win32.HANDLE, breakpointAddress: uintptr, appl
     delete_key(appliedBreakpoints, breakpointAddress)
 }
 
+// Writes the original instruction byte back without unregistering the breakpoint, so it
+// can be re-armed after we single-step over it (lets a breakpoint fire more than once).
+restoreOriginalInstruction :: proc(process: win32.HANDLE, address: uintptr, originalByte: u8) {
+    original := originalByte
+    bytesWritten: uint
+    res := win32.WriteProcessMemory(process, win32.LPCVOID(address), &original, 1, &bytesWritten)
+    assert(res == true && bytesWritten == 1)
+
+    res = FlushInstructionCache(process, win32.LPCVOID(address), 1)
+    assert(res == true)
+}
+
 setHardwareBreakpointForThread :: proc(threadId: u32, address: uintptr) {  
     threadHandler := win32.OpenThread(
         win32.THREAD_GET_CONTEXT | win32.THREAD_SET_CONTEXT,
@@ -133,17 +181,29 @@ stopDebuggerThread :: proc() {
     if windowData.debuggerThread == nil { return }
 
     win32.TerminateProcess(windowData.debuggerProcessHandler, 0)
-    for !thread.is_done(windowData.debuggerThread) { }
+    for !thread.is_done(windowData.debuggerThread) { win32.Sleep(1) }
 
     thread.join(windowData.debuggerThread)
     thread.destroy(windowData.debuggerThread)
-    
+
     windowData.debuggerThread = nil
     win32.CloseHandle(windowData.debuggerProcessHandler)
+
+    clearDebuggerLocals()
+    clearDebuggerCallStack()
 }
 
 runDebugThread :: proc(exePath: string) {
-    windowData.debuggerThread = thread.create_and_start_with_poly_data(exePath, runDebugProcess_Function, default_context)
+    if windowData.debuggerThread != nil { return } // a session is already running
+
+    // Own the path so it stays alive for the worker thread (it outlives the caller's buffer).
+    // Clone first: exePath may alias windowData.debuggerExePath (e.g. the F5 re-run path), so
+    // deleting before cloning would read freed memory.
+    newExePath := strings.clone(exePath)
+    delete(windowData.debuggerExePath)
+    windowData.debuggerExePath = newExePath
+
+    windowData.debuggerThread = thread.create_and_start_with_poly_data(windowData.debuggerExePath, runDebugProcess_Function, default_context)
 }
 
 // ThreadContext :: struct #align(16) {
@@ -186,22 +246,7 @@ runDebugProcess_Function :: proc(exePath: string) {
     
     defer windowData.debuggingFinished = true
 
-    Module :: struct {
-        name: string,
-        address: uintptr,
-        size: i32,
-        pdbFiles: [dynamic]PdbData,
-        exportFunctions: [dynamic]ExportFunction,
-    }
-    // PdbFile :: struct {
-    //     filePath: string,
-    //     content: []u8,
-    // }
-    ExportFunction :: struct {
-        name: string,
-        address: uintptr,
-    }
-    modules := make([dynamic]Module)
+    modules := make([dynamic]DebuggerModule)
     defer delete(modules)
 
     PdbInfo :: struct {
@@ -225,15 +270,25 @@ runDebugProcess_Function :: proc(exePath: string) {
 
     threadsIds := make([dynamic]u32)
 
-    pdbData := initPdbData("C:\\projects\\cpp_test_cmd\\x64\\Debug\\cpp_test_cmd.pdb")
-    //functionsWithRVA := getFunctionsWithRVA(pdbData)
+    // The debuggee's own pdb, discovered from its debug directory once the process is created.
+    // All source<->address mapping uses this instead of a hardcoded path, so any exe with a pdb works.
+    exePdbData: PdbData
+    exePdbValid := false
+    defer if exePdbValid {
+        exePdbData.globalSymbol->Release()
+        exePdbData.session->Release()
+    }
 
-    //testFunctionRVA := functionsWithRVA["main"]
-    // testFunctionRVA := testDia()
     exeBaseAddress: uintptr = 0
-    steppingToNextLine := false
-    originalStepFilePath: string
-    originalStepLine: u32 = 0
+    exeImageSize: u32 = 0
+
+    stepMode := StepMode.None
+    stepStartFile: string // owned clone of the source file a step began from
+    stepStartLine: u32 = 0
+    stepStartSp: u64 = 0  // RSP when the step began; keeps step-over from stopping inside a callee
+
+    rearmAddress: uintptr = 0  // a hit breakpoint waiting to be single-stepped over and re-armed
+    suppressPauseOnce := false // skip the source-line pause for the upcoming re-arm single-step
 
     for WaitForDebugEvent(&debugEvent, WIN32_INFINITE) {
         continueStatus: u32 = WIN32_DBG_EXCEPTION_NOT_HANDLED // why should it be always that and not WIN32_DBG_CONTINUE???
@@ -246,7 +301,7 @@ runDebugProcess_Function :: proc(exePath: string) {
         switch debugEvent.dwDebugEventCode {
         case 3: {
             fmt.println("CREATE_PROCESS_DEBUG_EVENT")
-            exe: Module
+            exe: DebuggerModule
             read: uint
 
             threadId := GetThreadId(debugEvent.u.CreateProcessInfo.hThread)
@@ -273,6 +328,7 @@ runDebugProcess_Function :: proc(exePath: string) {
             win32.ReadProcessMemory(processInfo.hProcess, rawptr(exeBasePointer + uintptr(dosHeader.e_lfanew)), &peHeader, size_of(peHeader), &read)
             
             exe.size = i32(peHeader.OptionalHeader.SizeOfImage)
+            exeImageSize = peHeader.OptionalHeader.SizeOfImage
 
             // exportDirectory: win32.IMAGE_EXPORT_DIRECTORY
             // win32.ReadProcessMemory(processInfo.hProcess, rawptr(dllBasePointer + uintptr(peHeader.OptionalHeader.ExportTable.VirtualAddress)), 
@@ -302,30 +358,62 @@ runDebugProcess_Function :: proc(exePath: string) {
                         &pdbInfo, size_of(pdbInfo), &read)
         
                     pdbNameBuffer: [260]byte
-                    win32.ReadProcessMemory(processInfo.hProcess, rawptr(exeBasePointer + uintptr(debugDirectory.AddressOfRawData) + size_of(pdbInfo)), 
+                    win32.ReadProcessMemory(processInfo.hProcess, rawptr(exeBasePointer + uintptr(debugDirectory.AddressOfRawData) + size_of(pdbInfo)),
                         raw_data(pdbNameBuffer[:]), 260, &read)
-        
+
                     pdbFilePath := strings.truncate_to_byte(string(pdbNameBuffer[:]), 0)
-                    pdbFileContent, err := os.read_entire_file_from_filename_or_err(pdbFilePath)
 
-                    pdbData := initPdbData(pdbFilePath)
+                    if os.exists(pdbFilePath) {
+                        modulePdb, pdbOk := initPdbData(pdbFilePath)
+                        if pdbOk {
+                            append(&exe.pdbFiles, modulePdb)
 
-                    append(&exe.pdbFiles, pdbData)
+                            if !exePdbValid {
+                                exePdbData = modulePdb
+                                exePdbValid = true
+                            }
+                        } else {
+                            fmt.println("Failed to load pdb:", pdbFilePath)
+                        }
+                    }
                     // fmt.println("Process pdb file:", strings.truncate_to_byte(string(pdbNameBuffer[:]), 0))
                 }
-            } 
-
-            // TODO: for now just set breakpoints that where defined before program run
-            //>
-            if len(windowData.debuggerBrakepoints) > 0 {           
-                testBreakpoint := windowData.debuggerBrakepoints[0]
-                brakepointRVA := getRVABySourcePosition(pdbData.session, testBreakpoint.filePath, testBreakpoint.line)
-
-                assert(brakepointRVA != 0)
-                applyBreakpoint(processInfo.hProcess, exeBaseAddress + uintptr(brakepointRVA), &appliedBreakpoints)
-                // setBreakpointForThread(debugEvent.dwThreadId, exeBaseAddress + uintptr(brakepointRVA))
-                // brakepointRVA
             }
+
+            // Fallback: if the debug directory didn't give us a usable pdb, look for one sitting
+            // next to the exe (the normal MSVC layout, e.g. foo.exe -> foo.pdb).
+            if !exePdbValid {
+                pdbGuess := fmt.tprintf("%s.pdb", strings.trim_suffix(exePath, ".exe"))
+                if os.exists(pdbGuess) {
+                    modulePdb, pdbOk := initPdbData(pdbGuess)
+                    if pdbOk {
+                        append(&exe.pdbFiles, modulePdb)
+                        exePdbData = modulePdb
+                        exePdbValid = true
+                    } else {
+                        fmt.println("Failed to load pdb:", pdbGuess)
+                    }
+                }
+            }
+
+            if !exePdbValid {
+                fmt.println("WARNING: no pdb loaded for the debuggee - breakpoints and source stepping won't work")
+            }
+
+            // Apply every breakpoint that was set before the program was launched.
+            //>
+            appliedCount := 0
+            if exePdbValid {
+                for bp in windowData.debuggerBrakepoints {
+                    brakepointRVA := getRVABySourcePosition(exePdbData.session, bp.filePath, bp.line)
+                    fmt.printfln("Breakpoint %s:%i -> RVA %#X", bp.filePath, bp.line, brakepointRVA)
+                    if brakepointRVA == 0 { continue } // line isn't in this exe's pdb, skip it
+
+                    applyBreakpoint(processInfo.hProcess, exeBaseAddress + uintptr(brakepointRVA), &appliedBreakpoints)
+                    appliedCount += 1
+                }
+            }
+            fmt.printfln("Applied %i of %i breakpoint(s)", appliedCount, len(windowData.debuggerBrakepoints))
             //<
 
             //test := getRVABySourcePosition(pdbData.session, "C:\\projects\\cpp_test_cmd\\cpp_test_cmd\\main.cpp", 11)
@@ -379,6 +467,13 @@ runDebugProcess_Function :: proc(exePath: string) {
             if expectStepException && debugEvent.u.Exception.ExceptionRecord.ExceptionCode == win32.EXCEPTION_SINGLE_STEP {
                 continueStatus = WIN32_DBG_CONTINUE
                 expectStepException = false
+
+                // We've now executed the original instruction at a hit breakpoint, so put the
+                // 0xCC back to keep the breakpoint active for subsequent hits (e.g. inside loops).
+                if rearmAddress != 0 {
+                    applyBreakpoint(processInfo.hProcess, rearmAddress, &appliedBreakpoints)
+                    rearmAddress = 0
+                }
             }
 
             switch debugEvent.u.Exception.ExceptionRecord.ExceptionCode {
@@ -395,11 +490,13 @@ runDebugProcess_Function :: proc(exePath: string) {
                 ctx: win32.CONTEXT
                 ctx.ContextFlags = win32.WOW64_CONTEXT_ALL
                 win32.GetThreadContext(threadHandler, &ctx)
-                
-                rva := uintptr(ctx.Rip) - exeBaseAddress
-                fileName, line, _, _ := getSourcePositionByRVA(pdbData.session, u32(rva))
 
-                fmt.println("HIT!!!!!! ", fileName, line)
+                fileName: string
+                line: u32
+                if exePdbValid {
+                    rva := uintptr(ctx.Rip) - exeBaseAddress
+                    fileName, line, _, _ = getSourcePositionByRVA(exePdbData.session, u32(rva))
+                }
 
                 windowData.currentDebuggerInstruction = SingleBrakepoint{
                     filePath = fileName, line = i32(line)
@@ -412,14 +509,19 @@ runDebugProcess_Function :: proc(exePath: string) {
                         fmt.println(win32.GetLastError())
                         panic("ERROR SAVING THREAD CTX")
                     }
+
+                    // We planted this temp breakpoint (e.g. step-over's run-to-return), so it's
+                    // handled - don't pass the exception on to the debuggee.
+                    continueStatus = WIN32_DBG_CONTINUE
                 }
 
+                // temporary (step) breakpoints are one-shot: restore the original bytes and drop them
                 for breakpointAddress, originalInstruction in tmpBreakpoints {
-                    removeBreakpoint(processInfo.hProcess, breakpointAddress, &tmpBreakpoints)   
+                    restoreOriginalInstruction(processInfo.hProcess, breakpointAddress, originalInstruction)
                 }
                 clear(&tmpBreakpoints)
 
-                if uintptr(ctx.Rip) - 1 in appliedBreakpoints {    
+                if uintptr(ctx.Rip) - 1 in appliedBreakpoints {
                     // since RIP regisgter points to the next instruction
                     // in order to correctly resote original instruction in which the first byte was replaced by software breakpoint
                     // we have to move RIP 1 byte back and restore the original instruction
@@ -430,7 +532,11 @@ runDebugProcess_Function :: proc(exePath: string) {
                         panic("ERROR SAVING THREAD CTX")
                     }
 
-                    removeBreakpoint(processInfo.hProcess, uintptr(ctx.Rip), &appliedBreakpoints)   
+                    // Restore the original instruction so it can run, but keep the breakpoint
+                    // registered. It will be re-armed once we single-step over it on continue.
+                    restoreOriginalInstruction(processInfo.hProcess, uintptr(ctx.Rip), appliedBreakpoints[uintptr(ctx.Rip)])
+                    rearmAddress = uintptr(ctx.Rip)
+                    continueStatus = WIN32_DBG_CONTINUE // we handled our own breakpoint
                 }
             case win32.EXCEPTION_DATATYPE_MISALIGNMENT: fmt.println("EXCEPTION_DATATYPE_MISALIGNMENT")     
             case win32.EXCEPTION_FLT_DENORMAL_OPERAND: fmt.println("EXCEPTION_FLT_DENORMAL_OPERAND")     
@@ -570,7 +676,7 @@ runDebugProcess_Function :: proc(exePath: string) {
             // }
 
             fmt.printfln("Load DLL: %s (%#X)", dllName, dllBasePointer)
-            append(&modules, Module{
+            append(&modules, DebuggerModule{
                 name = dllName,
                 address = dllBasePointer,
                 size = i32(peHeader.OptionalHeader.SizeOfImage),
@@ -637,190 +743,129 @@ runDebugProcess_Function :: proc(exePath: string) {
 
         // addressToCheck := exeBaseAddress + uintptr(testFunctionRVA)
         addressToCheck := uintptr(ctx.Rip)
-        for module in modules {
-            startAddress := module.address 
-            endAddress := module.address + uintptr(module.size)
 
-            if addressToCheck >= startAddress && addressToCheck < endAddress {
-                // check is the function in exports table
-                functionName: string
-                minFunctionStartOffset := uintptr((1 << 64) - 1)
-                for exportFunction in module.exportFunctions {
-                    if addressToCheck >= exportFunction.address {
-                        startOffset := addressToCheck - exportFunction.address
+        // The source-level stepping engine. While a step is in progress we drive it ourselves,
+        // independent of the breakpoint/module-match path below, so we stay in control even
+        // through library code that has no source info.
+        if stepMode != .None {
+            // Only the exe carries source info, so only ask DIA when RIP is inside it (and avoid a
+            // bogus RVA lookup while stepping through library code).
+            inExe := exePdbValid && addressToCheck >= exeBaseAddress && addressToCheck < exeBaseAddress + uintptr(exeImageSize)
 
-                        if minFunctionStartOffset > startOffset {
-                            minFunctionStartOffset = startOffset
-                            functionName = exportFunction.name
+            // `file` is temp-allocated by DIA (wstring_to_utf8) and must not be freed here.
+            file: string
+            line: u32
+            if inExe {
+                file, line, _, _ = getSourcePositionByRVA(exePdbData.session, u32(uintptr(ctx.Rip) - exeBaseAddress))
+            }
+
+            atNewSourceLine := inExe && file != "" && (file != stepStartFile || u32(line) != stepStartLine)
+
+            // step-over also requires we're not inside a deeper call frame (a smaller RSP)
+            shouldStop := atNewSourceLine && (stepMode == .Into || ctx.Rsp >= stepStartSp)
+
+            if shouldStop {
+                windowData.currentDebuggerInstruction = SingleBrakepoint{ filePath = file, line = i32(line) }
+                if len(stepStartFile) > 0 { delete(stepStartFile) }
+                stepStartFile = ""
+                stepMode = .None
+                stopDebugger = true
+            } else {
+                armStepMove(processInfo.hProcess, threadHandler, &ctx, stepMode, &tmpBreakpoints, &expectStepException, &continueStatus)
+                stopDebugger = false
+            }
+        } else if suppressPauseOnce {
+            suppressPauseOnce = false
+        } else {
+            for module in modules {
+                startAddress := module.address
+                endAddress := module.address + uintptr(module.size)
+
+                if addressToCheck >= startAddress && addressToCheck < endAddress {
+                    // check is the function in exports table
+                    functionName: string
+                    minFunctionStartOffset := uintptr((1 << 64) - 1)
+                    for exportFunction in module.exportFunctions {
+                        if addressToCheck >= exportFunction.address {
+                            startOffset := addressToCheck - exportFunction.address
+
+                            if minFunctionStartOffset > startOffset {
+                                minFunctionStartOffset = startOffset
+                                functionName = exportFunction.name
+                            }
                         }
                     }
-                }
 
-                // check is the function is pdb file
-                for pdbFile in module.pdbFiles {
-                    rva := uintptr(ctx.Rip) - module.address
-                    functionName, _ = getFunctionNameByRVA(pdbData.session, u32(rva))
-                    fileName, line, column, _ := getSourcePositionByRVA(pdbData.session, u32(rva))
-        
-                    //test := getRVABySourcePosition(pdbData.session, "C:\\projects\\cpp_test_cmd\\cpp_test_cmd\\main.cpp", 11)
-                    // test := getRVABySourcePosition(pdbData.session, "C:\\projects\\DirectXTemplate\\DirectXTemplate\\gpuShaders.cpp", 11)
+                    // check is the function is in a pdb file (use that module's own pdb)
+                    for pdbFile in module.pdbFiles {
+                        rva := uintptr(ctx.Rip) - module.address
+                        functionName, _ = getFunctionNameByRVA(pdbFile.session, u32(rva))
+                        fileName, line, column, _ := getSourcePositionByRVA(pdbFile.session, u32(rva))
 
-                    stopDebugger = true
-                    fmt.printfln("source %s %i %i", fileName, line, column)
+                        stopDebugger = true
+                        fmt.printfln("source %s %i %i", fileName, line, column)
+                    }
+                    fmt.printfln("match %s %s %i", module.name, functionName, addressToCheck)
                 }
-                fmt.printfln("match %s %s %i", module.name, functionName, addressToCheck)
             }
         }
+
+        if stopDebugger && exePdbValid {
+            collectDebuggerLocals(processInfo.hProcess, exePdbData, exeBaseAddress, ctx)
+        }
+        if stopDebugger {
+            collectDebuggerCallStack(processInfo.hProcess, threadHandler, ctx, modules[:])
+        }
         // ctx.Rip
+
+        // Tell any front-end (e.g. the cmd debugger) that we're parked at a stop waiting for a
+        // command. The GUI ignores this; the cmd debugger waits on it to know when to print/prompt.
+        if stopDebugger {
+            sync.atomic_store(&windowData.debuggerPaused, true)
+        }
 
         //> testing
         for stopDebugger {
             if !isProcessRunning(windowData.debuggerProcessHandler) { return }
 
-            if steppingToNextLine {
-                rva := uintptr(ctx.Rip) - exeBaseAddress
-                fileName, line, column, length := getSourcePositionByRVA(pdbData.session, u32(rva))
-
-                // TODO: ADD NORMAL FILE FILTERING!!!
-                if fileName == "" || !strings.starts_with(fileName, "C:\\projects\\cpp_test_cmd") || (originalStepFilePath == fileName && originalStepLine == line) {
-                    expectStepException = true
-                    continueStatus = WIN32_DBG_CONTINUE
-                    ctx.EFlags |= 0x100
-                    assert(win32.SetThreadContext(threadHandler, &ctx) == true)
-
-                    // if there's a function call don't use trap flag, but instead set breakpoint on the next instruction
-                    
-                } else {
-                    applyBreakpoint(processInfo.hProcess, uintptr(ctx.Rip), &tmpBreakpoints)
-
-                    steppingToNextLine = false
-                }
-                break
-            }
-
             if sync.atomic_load(&windowData.debuggerCommand) == .CONTINUE {
                 sync.atomic_store(&windowData.debuggerCommand, .NONE)
-                break
-            }
 
-            if sync.atomic_load(&windowData.debuggerCommand) == .STEP {
-                sync.atomic_store(&windowData.debuggerCommand, .NONE)
-
-                //> advancing to the next line line
-                rva := uintptr(ctx.Rip) - exeBaseAddress
-                fileName, line, column, length := getSourcePositionByRVA(pdbData.session, u32(rva))
-
-                rva += uintptr(length)
-
-                applyBreakpoint(processInfo.hProcess, exeBaseAddress + rva, &tmpBreakpoints)
-                //<
-
-                instructions: [1024]u8
-                res := win32.ReadProcessMemory(processInfo.hProcess, rawptr(uintptr(ctx.Rip)), raw_data(instructions[:]), uint(length), nil)
-                assert(res == true, "Could not read the debugged process memory")
-
-                zydisInstruction: ZydisDisassembledInstruction
-
-                offset: u64 = 0
-                runtimeAddress := uintptr(ctx.Rip)
-
-                for ZydisDisassembleIntel(0, rawptr(runtimeAddress), rawptr(uintptr(raw_data(instructions[:])) + uintptr(offset)), u64(length) - offset, &zydisInstruction) & 0x80000000 == 0 {
-                    offset += u64(zydisInstruction.info.length)
-                    runtimeAddress += uintptr(zydisInstruction.info.length)
-
-                    switch zydisInstruction.info.opcode {
-                    case
-                        0xE8, // call
-                        0x74, // je
-                        0x7E, // jle
-                        0xEB, // jmp
-                        0x7D: // jnl
-                        address := i128(runtimeAddress) + i128(zydisInstruction.operands[0].value.imm.value.s)
-                        applyBreakpoint(processInfo.hProcess, uintptr(address), &tmpBreakpoints)
-                        // append(&potentialAddresses, uintptr(address))
-
-                        //fmt.printfln("YEAH(%#X)", address)
-                    }
-                   
-                    // fmt.printfln("opcode(%#X) %s", zydisInstruction.info.opcode, cstring(raw_data(zydisInstruction.text[:])))
-                    fmt.println(cstring(raw_data(zydisInstruction.text[:])))
-                    // setBreakpointForThread(debugEvent.dwThreadId, exeBaseAddress + rva)
+                // If we're sitting on a breakpoint, step over the restored instruction first so the
+                // breakpoint can be re-armed (handled on the resulting single-step event) before running.
+                if rearmAddress != 0 {
+                    expectStepException = true
+                    suppressPauseOnce = true
+                    ctx.EFlags |= 0x100 // trap flag -> single step
+                    assert(win32.SetThreadContext(threadHandler, &ctx) == true)
+                    continueStatus = WIN32_DBG_CONTINUE
                 }
-
-                continueStatus = WIN32_DBG_CONTINUE
                 break
             }
 
-            if sync.atomic_load(&windowData.debuggerCommand) == .READ {
+            stepCommand := sync.atomic_load(&windowData.debuggerCommand)
+            if stepCommand == .STEP_OVER || stepCommand == .STEP_INTO {
                 sync.atomic_store(&windowData.debuggerCommand, .NONE)
 
-                expectStepException = true
-                continueStatus = WIN32_DBG_CONTINUE
-                ctx.EFlags |= 0x100
-                assert(win32.SetThreadContext(threadHandler, &ctx) == true)
-
-                //fmt.printfln("CURRENT RIP: %#X", ctx.Rip)
-
+                // Record where the step began; the engine (above) compares against this on each
+                // single-step / run-over event to decide when we've reached a new source line.
+                // `file` is temp-allocated by DIA (don't free it); we keep a heap clone instead.
                 rva := uintptr(ctx.Rip) - exeBaseAddress
-                fileName, line, column, length := getSourcePositionByRVA(pdbData.session, u32(rva))
+                file, line, _, _ := getSourcePositionByRVA(exePdbData.session, u32(rva))
 
-                originalStepFilePath = fileName
-                originalStepLine = line
+                if len(stepStartFile) > 0 { delete(stepStartFile) }
+                stepStartFile = strings.clone(file) if len(file) > 0 else ""
+                stepStartLine = line
+                stepStartSp = ctx.Rsp
+                stepMode = stepCommand == .STEP_OVER ? .Over : .Into
 
-                steppingToNextLine = true
-
+                armStepMove(processInfo.hProcess, threadHandler, &ctx, stepMode, &tmpBreakpoints, &expectStepException, &continueStatus)
                 break
-                // instructionAddress := uintptr(ctx.Rip) - exeBaseAddress
-                
-                // rva := uintptr(ctx.Rip) - exeBaseAddress
-                // _, _, _, length := getSourcePositionByRVA(pdbData.session, u32(rva))
-
-                // instructions: [1024]u8
-                // read: uint
-                // res := win32.ReadProcessMemory(processInfo.hProcess, rawptr(uintptr(ctx.Rip)), raw_data(instructions[:]), uint(length), &read)
-                // assert(res == true, "Could not read the debugged process memory")
-
-                // zydisInstruction: ZydisDisassembledInstruction
-
-                // offset: u64 = 0
-                // runtimeAddress := uintptr(ctx.Rip)
-                // potentialAddresses := make([dynamic]uintptr)
-                // defer delete(potentialAddresses)
-
-                // for ZydisDisassembleIntel(0, rawptr(runtimeAddress), rawptr(uintptr(raw_data(instructions[:])) + uintptr(offset)), u64(length) - offset, &zydisInstruction) & 0x80000000 == 0 {
-                //     offset += u64(zydisInstruction.info.length)
-                //     runtimeAddress += uintptr(zydisInstruction.info.length)
-
-                //     switch zydisInstruction.info.opcode {
-                //     case
-                //         0xE8, // call
-                //         0x74, // je
-                //         0x7E, // jle
-                //         0xEB, // jmp
-                //         0x7D: // jnl
-                //         address := i128(runtimeAddress) + i128(zydisInstruction.operands[0].value.imm.value.s)
-                //         append(&potentialAddresses, uintptr(address))
-
-                //         //fmt.printfln("YEAH(%#X)", address)
-                //     }
-                   
-                //     // fmt.printfln("opcode(%#X) %s", zydisInstruction.info.opcode, cstring(raw_data(zydisInstruction.text[:])))
-                //     fmt.println(cstring(raw_data(zydisInstruction.text[:])))
-                //     // setBreakpointForThread(debugEvent.dwThreadId, exeBaseAddress + rva)
-                // }
-
-                // fmt.println("POTENTIAL ADDRESSES:")
-                // for address in potentialAddresses {
-                //     fmt.println(address)
-                // }
-
-                // fmt.printf("line has %i bytes, machine code: ", length)
-                // for i in 0..=length {
-                //     fmt.print(strings.right_justify(fmt.tprintf("%X", instructions[i]), 2, "0"))
-                // }
-                // fmt.println("")
             }
+
+            win32.Sleep(1) // we're paused waiting for a user command; don't busy-spin a core
         }
+        sync.atomic_store(&windowData.debuggerPaused, false) // resuming
         //<
 
         //> render registers
@@ -839,11 +884,156 @@ runDebugProcess_Function :: proc(exePath: string) {
     // win32.CloseHandle(processInfo.hProcess)
 }
 
-isProcessRunning :: proc(handle: win32.HANDLE) -> bool { 
+isProcessRunning :: proc(handle: win32.HANDLE) -> bool {
     exitCode: win32.DWORD
     win32.GetExitCodeProcess(handle, &exitCode)
 
     return exitCode == 259 // STILL_ACTIVE
+}
+
+// If the instruction at `address` is a CALL, returns its byte length and true. Used by step-over
+// to run the whole call at native speed (by breakpointing the return address) instead of
+// single-stepping through it. Detection uses Zydis's rendered mnemonic, covering direct and
+// indirect (e.g. imported-function) calls alike.
+callInstructionAt :: proc(process: win32.HANDLE, address: uintptr) -> (length: u32, isCall: bool) {
+    buf: [16]u8 // x86-64 instructions are at most 15 bytes
+    read: uint
+    if !win32.ReadProcessMemory(process, win32.LPCVOID(address), raw_data(buf[:]), uint(len(buf)), &read) || read == 0 {
+        return 0, false
+    }
+
+    inst: ZydisDisassembledInstruction
+    if ZydisDisassembleIntel(0, rawptr(address), raw_data(buf[:]), u64(read), &inst) & 0x80000000 != 0 {
+        return 0, false
+    }
+
+    text := string(cstring(raw_data(inst.text[:])))
+    return u32(inst.info.length), strings.has_prefix(text, "call")
+}
+
+// Arms the next move of an in-progress step: for step-over, if we're sitting on a CALL, set a
+// one-shot breakpoint at the return address so the call runs at full speed; otherwise single-step
+// one instruction with the trap flag. Called both when a step starts and after each step event.
+armStepMove :: proc(process: win32.HANDLE, threadHandler: win32.HANDLE, ctx: ^win32.CONTEXT,
+    mode: StepMode, tmpBreakpoints: ^map[uintptr]u8, expectStepException: ^bool, continueStatus: ^u32) {
+
+    if mode == .Over {
+        if insLen, isCall := callInstructionAt(process, uintptr(ctx.Rip)); isCall {
+            applyBreakpoint(process, uintptr(ctx.Rip) + uintptr(insLen), tmpBreakpoints)
+            continueStatus^ = WIN32_DBG_CONTINUE
+            return
+        }
+    }
+
+    expectStepException^ = true
+    ctx.EFlags |= 0x100 // trap flag -> single step
+    assert(win32.SetThreadContext(threadHandler, ctx) == true)
+    continueStatus^ = WIN32_DBG_CONTINUE
+}
+
+// Maps a CodeView (cvconst.h) AMD64 register id to the matching value in the thread context.
+registerValueById :: proc(ctx: win32.CONTEXT, registerId: win32.DWORD) -> u64 {
+    // NOTE: cvconst.h CV_AMD64_* order is RAX,RBX,RCX,RDX,RSI,RDI,RBP,RSP — NOT the x86
+    // ModRM order. Frame-relative locals are usually RBP(334)/RSP(335)-based, so getting
+    // these wrong makes them resolve to garbage addresses.
+    switch registerId {
+    case 328: return u64(ctx.Rax)
+    case 329: return u64(ctx.Rbx)
+    case 330: return u64(ctx.Rcx)
+    case 331: return u64(ctx.Rdx)
+    case 332: return u64(ctx.Rsi)
+    case 333: return u64(ctx.Rdi)
+    case 334: return u64(ctx.Rbp)
+    case 335: return u64(ctx.Rsp)
+    case 336: return u64(ctx.R8)
+    case 337: return u64(ctx.R9)
+    case 338: return u64(ctx.R10)
+    case 339: return u64(ctx.R11)
+    case 340: return u64(ctx.R12)
+    case 341: return u64(ctx.R13)
+    case 342: return u64(ctx.R14)
+    case 343: return u64(ctx.R15)
+    }
+    return 0
+}
+
+freeDebuggerLocalsContents :: proc(locals: ^[dynamic]DebuggerVariable) {
+    for local in locals {
+        delete(local.name)
+        delete(local.value)
+    }
+}
+
+clearDebuggerLocals :: proc() {
+    sync.mutex_lock(&windowData.debuggerLocalsMutex)
+    defer sync.mutex_unlock(&windowData.debuggerLocalsMutex)
+
+    freeDebuggerLocalsContents(&windowData.debuggerLocals)
+    clear(&windowData.debuggerLocals)
+}
+
+// Snapshots the locals/parameters of the function we're currently stopped in by reading their
+// frame-relative (LocIsRegRel) values from the debuggee's memory. This covers typical /Zi /Od
+// debug builds; variables scoped to nested blocks aren't enumerated yet.
+collectDebuggerLocals :: proc(process: win32.HANDLE, pdb: PdbData, baseAddress: uintptr, ctx: win32.CONTEXT) {
+    LocIsRegRel :: 3 // cvconst.h LocationType
+
+    newLocals := make([dynamic]DebuggerVariable)
+
+    if pdb.session != nil {
+        rva := u32(uintptr(ctx.Rip) - baseAddress)
+
+        funcSym: ^IDiaSymbol
+        if pdb.session->findSymbolByRVA(rva, .SymTagFunction, &funcSym) == 0 && funcSym != nil {
+            defer funcSym->Release()
+
+            enumSymbols: ^IDiaEnumSymbols
+            if funcSym->findChildren(.SymTagData, nil, 0, &enumSymbols) == 0 && enumSymbols != nil {
+                defer enumSymbols->Release()
+
+                sym: ^IDiaSymbol
+                celt: win32.ULONG
+                for enumSymbols->Next(1, &sym, &celt) == 0 && celt == 1 {
+                    defer sym->Release()
+
+                    locationType: win32.DWORD
+                    sym->get_locationType(&locationType)
+                    if locationType != LocIsRegRel { continue }
+
+                    registerId: win32.DWORD
+                    sym->get_registerId(&registerId)
+
+                    offset: win32.LONG
+                    sym->get_offset(&offset)
+
+                    nameBstr: win32.BSTR
+                    if sym->get_name(&nameBstr) != 0 { continue }
+                    // wstring_to_utf8 already allocates an owned copy; it's freed later by
+                    // freeDebuggerLocalsContents, so store it directly (cloning would leak this one).
+                    name, _ := win32.wstring_to_utf8(win32.wstring(nameBstr), -1)
+
+                    address := uintptr(i64(registerValueById(ctx, registerId)) + i64(offset))
+
+                    rawValue: u64
+                    read: uint
+                    win32.ReadProcessMemory(process, win32.LPCVOID(address), &rawValue, size_of(rawValue), &read)
+
+                    valueStr := fmt.aprintf("0x%X (%d)", rawValue, transmute(i64)rawValue) if read == size_of(rawValue) else strings.clone("<unreadable>")
+
+                    append(&newLocals, DebuggerVariable{
+                        name = name,
+                        value = valueStr,
+                    })
+                }
+            }
+        }
+    }
+
+    sync.mutex_lock(&windowData.debuggerLocalsMutex)
+    freeDebuggerLocalsContents(&windowData.debuggerLocals)
+    delete(windowData.debuggerLocals)
+    windowData.debuggerLocals = newLocals
+    sync.mutex_unlock(&windowData.debuggerLocalsMutex)
 }
 
 test :: proc() {

@@ -260,8 +260,8 @@ fillGlyphsLocations :: proc(ctx: ^EditableTextContext) {
                 continue 
             }
 
-            glyphSize: float2 = { f32(fontChar.rect.right - fontChar.rect.left), f32(fontChar.rect.top - fontChar.rect.bottom) }
-            glyphPosition: float2 = { screenPosition.x + f32(fontChar.offset.x), screenPosition.y - glyphSize.y - f32(fontChar.offset.y) }
+            glyphSize := fontChar.size
+            glyphPosition: float2 = { screenPosition.x + fontChar.offset.x, screenPosition.y - glyphSize.y - fontChar.offset.y }
 
             ctx.glyphsLocations[charIndex] = GlyphsLocation{
                 position = glyphPosition,

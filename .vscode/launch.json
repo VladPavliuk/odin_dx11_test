@@ -13,6 +13,16 @@
             "cwd": "${workspaceFolder}/bin",
             "args": [],
             "preLaunchTask": "odin build"
+        },
+        {
+            "name": "Debug (cmd debugger)",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/bin/cmd_debugger.exe",
+            "cwd": "${workspaceFolder}/bin",
+            "args": [],
+            "externalConsole": true,
+            "preLaunchTask": "odin build cmd-debugger"
         }
     ]
 }

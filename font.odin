@@ -1,25 +1,32 @@
 package main
 
 import "ui"
-import "core:mem"
 import "core:os"
 import "vendor:directx/d3d11"
 import "vendor:directx/dxgi"
 import stbtt "vendor:stb/truetype"
+
+// Atlas oversampling: each glyph is rasterised at this multiple of its display
+// size and downsampled by the linear sampler, which sharpens small text and
+// improves sub-pixel positioning. 2x2 is stb's recommended high-quality default
+// (costs ~4x the atlas area, hence the larger bitmap below).
+FONT_OVERSAMPLE_X :: 2
+FONT_OVERSAMPLE_Y :: 2
 
 // NOTE: struct is packed, because for GPU no padding allowed
 FontGlyphGpu :: struct #packed {
     sourceRect: ui.Rect,
     targetTransformation: mat4,
     color: float4,
-    
+
     textureOffset: float2,
     textureScale: float2,
 }
 
 FontChar :: struct {
-    rect: ui.Rect,
-    offset: int2,
+    rect: ui.Rect,    // glyph region in the atlas, in (oversampled) texels
+    offset: float2,   // screen-space offset from the pen position to the glyph's top-left
+    size: float2,     // screen-space size of the glyph quad
     xAdvance: f32,
 }
 
@@ -43,8 +50,8 @@ loadFont :: proc(fontPath: string) -> (GpuTexture, FontData) {
     defer delete(fileContent)
     // defer delete(fontData.ttfFile)
 
-    bitmapSize: int2 = { 512, 512 }
-    
+    bitmapSize: int2 = { 1024, 1024 } // larger atlas to fit oversampled glyphs
+
     // fontChars := make(map[u16]FontChar)
     // charsData: [95]stbtt.bakedchar
     tmpFontBitmap := make([]byte, bitmapSize.x * bitmapSize.y)
@@ -55,11 +62,14 @@ loadFont :: proc(fontPath: string) -> (GpuTexture, FontData) {
     fontData := BakeFontBitmapCustomChars(fileContent, 20.0, tmpFontBitmap, bitmapSize, alphabet)
 
     textureDesc := d3d11.TEXTURE2D_DESC{
-        Width = u32(bitmapSize.x), 
+        Width = u32(bitmapSize.x),
         Height = u32(bitmapSize.y),
         MipLevels = 1,
         ArraySize = 1,
-        Format = dxgi.FORMAT.R8_UINT,
+        // NOTE: R8_UNORM (not R8_UINT) so the atlas can be hardware-filtered.
+        // UINT textures can only be point-fetched via .Load; UNORM allows linear
+        // sampling, which gives us smooth, sub-pixel-correct glyph edges.
+        Format = dxgi.FORMAT.R8_UNORM,
         SampleDesc = {
             Count = 1,
             Quality = 0,
@@ -79,7 +89,7 @@ loadFont :: proc(fontPath: string) -> (GpuTexture, FontData) {
     texture: ^d3d11.ITexture2D
     hr := directXState.device->CreateTexture2D(&textureDesc, &data, &texture)
     assert(hr == 0)
-    
+
     srvDesc := d3d11.SHADER_RESOURCE_VIEW_DESC{
         Format = textureDesc.Format,
         ViewDimension = d3d11.SRV_DIMENSION.TEXTURE2D,
@@ -106,24 +116,20 @@ loadFont :: proc(fontPath: string) -> (GpuTexture, FontData) {
 	// stbtt.GetFontVMetrics(&font, &ascent, &descent, &lineGap)
 
     // ascent = i32(f32(ascent) * fontScale)
-    // descent = i32(f32(descent) * fontScale) 
+    // descent = i32(f32(descent) * fontScale)
     // lineGap = i32(f32(lineGap) * fontScale)
 }
 
 BakeFontBitmapCustomChars :: proc(data: []byte, pixelHeight: f32, bitmap: []byte, bitmapSize: int2, charsList: string) -> FontData {
-    x, y, bottomY: i32
     font: stbtt.fontinfo
 
     if !stbtt.InitFont(&font, raw_data(data), 0) {
         panic("Error font parsing")
     }
-    x = 1
-    y = 1
-	bottomY = 1
 
     ascent, descent, lineGap: i32
     stbtt.GetFontVMetrics(&font, &ascent, &descent, &lineGap)
-    
+
     scale := stbtt.ScaleForPixelHeight(&font, pixelHeight)
     fontData := FontData{
         ascent = f32(ascent) * scale,
@@ -133,45 +139,53 @@ BakeFontBitmapCustomChars :: proc(data: []byte, pixelHeight: f32, bitmap: []byte
     }
     fontData.lineHeight = fontData.ascent - fontData.descent
 
+    // Collect the codepoints to bake (charsList is UTF-8, so decode to runes).
+    runesList := make([dynamic]rune, 0, len(charsList))
+    defer delete(runesList)
     for char in charsList {
-        advance, lsb, x0, y0, x1, y1, gw, gh: i32
+        append(&runesList, char)
+    }
 
-        g := stbtt.FindGlyphIndex(&font, char)
+    // Let stb pack + rasterise every glyph with oversampling. PackFontRanges
+    // fills packedchar with atlas coords plus sub-pixel-correct screen offsets.
+    chardata := make([]stbtt.packedchar, len(runesList))
+    defer delete(chardata)
 
-        stbtt.GetGlyphHMetrics(&font, g, &advance, &lsb)
-        stbtt.GetGlyphBitmapBox(&font, g, fontData.scale, fontData.scale, &x0, &y0, &x1, &y1)
+    ranges := []stbtt.pack_range{
+        {
+            font_size = pixelHeight,
+            array_of_unicode_codepoints = raw_data(runesList[:]),
+            num_chars = i32(len(runesList)),
+            chardata_for_range = &chardata[0],
+        },
+    }
 
-        gw = x1 - x0
-        gh = y1 - y0
-        if x + gw + 1 >= bitmapSize.x {
-            y = bottomY
-            x = 1
-        }
-        if y + gh + 1 >= bitmapSize.y {
-            panic("Bitmap size is nout enough to fit font")
-        }
+    spc: stbtt.pack_context
+    if stbtt.PackBegin(&spc, raw_data(bitmap), bitmapSize.x, bitmapSize.y, 0, 1, nil) == 0 {
+        panic("Failed to initialise font atlas packing")
+    }
+    stbtt.PackSetOversampling(&spc, FONT_OVERSAMPLE_X, FONT_OVERSAMPLE_Y)
+    if stbtt.PackFontRanges(&spc, raw_data(data), 0, raw_data(ranges), 1) == 0 {
+        panic("Font atlas is not big enough to fit all glyphs")
+    }
+    stbtt.PackEnd(&spc)
 
-        bitmapOffset := mem.ptr_offset(raw_data(bitmap), x + y * bitmapSize.y)
-        // xtest: f32
-        // ytest: f32
-        // stbtt.MakeGlyphBitmapSubpixelPrefilter(&font, bitmapOffset, gw, gh, bitmapSize.x, fontData.scale, fontData.scale, 2.0, 2.0, 2, 2, &xtest, &ytest, g)
-        // stbtt.MakeGlyphBitmapSubpixel(&font, bitmapOffset, gw, gh, bitmapSize.x, fontData.scale, fontData.scale, 1.0, 1.0, g)
-        stbtt.MakeGlyphBitmap(&font, bitmapOffset, gw, gh, bitmapSize.x, fontData.scale, fontData.scale, g)
+    for char, i in runesList {
+        pc := chardata[i]
 
         fontData.chars[char] = FontChar{
+            // NOTE: y0 is the glyph's top row in the atlas (smaller texel-y) and y1
+            // the bottom row; the shader treats rect.bottom as the top row, rect.top
+            // as the bottom row, so map them accordingly.
             rect = ui.Rect{
-                top = y + gh,
-                bottom = y,
-                left = x,
-                right = x + gw,
+                left = i32(pc.x0),
+                right = i32(pc.x1),
+                bottom = i32(pc.y0),
+                top = i32(pc.y1),
             },
-            offset = { x0, y0 },
-            xAdvance = fontData.scale * f32(advance),
-        }
-
-        x = x + gw + 1
-        if y + gh + 1 > bottomY {
-            bottomY = y + gh + 1
+            offset = { pc.xoff, pc.yoff },
+            size = { pc.xoff2 - pc.xoff, pc.yoff2 - pc.yoff },
+            xAdvance = pc.xadvance,
         }
     }
 
@@ -188,9 +202,11 @@ BakeFontBitmapCustomChars :: proc(data: []byte, pixelHeight: f32, bitmap: []byte
     // TODO: make this behaviour configurable
     // NOTE: Since tab symbol has a weird glyph sometimes, just rewrite visual part of it by space glyph
     tabGlyph := fontData.chars['\t']
+    spaceGlyph := fontData.chars[' ']
 
-    tabGlyph.offset = fontData.chars[' '].offset
-    tabGlyph.rect = fontData.chars[' '].rect
+    tabGlyph.offset = spaceGlyph.offset
+    tabGlyph.rect = spaceGlyph.rect
+    tabGlyph.size = spaceGlyph.size
 
     fontData.chars['\t'] = tabGlyph
 

@@ -15,6 +15,7 @@ DirectXState :: struct {
     depthStencilState: ^d3d11.IDepthStencilState,
     blendState: ^d3d11.IBlendState,
 	samplerState: ^d3d11.ISamplerState,
+	fontSamplerState: ^d3d11.ISamplerState,
 
     textures: [TextureId]GpuTexture,
     vertexBuffers: [GpuBufferType]GpuBuffer,
@@ -127,6 +128,21 @@ initDirectX :: proc() {
     res = directXState.device->CreateSamplerState(&samplerDesc, &directXState.samplerState)
     assert(res == 0)
 
+    // Dedicated sampler for the glyph atlas: linear filtering so fractional glyph
+    // positions are smoothly interpolated, and CLAMP addressing so sampling at a
+    // glyph's edge never wraps into a neighbouring glyph on the opposite side.
+    fontSamplerDesc := d3d11.SAMPLER_DESC{
+        Filter = .MIN_MAG_MIP_LINEAR,
+        AddressU = .CLAMP,
+        AddressV = .CLAMP,
+        AddressW = .CLAMP,
+        ComparisonFunc = .NEVER,
+        MinLOD = 0,
+        MaxLOD = d3d11.FLOAT32_MAX,
+    }
+    res = directXState.device->CreateSamplerState(&fontSamplerDesc, &directXState.fontSamplerState)
+    assert(res == 0)
+
     viewport := d3d11.VIEWPORT{
         0, 0,
         f32(depthBufferDesc.Width), f32(depthBufferDesc.Height),
@@ -176,6 +192,7 @@ clearDirectX :: proc() {
     directXState.rasterizerState->Release()
     directXState.depthStencilState->Release()
     directXState.samplerState->Release()
+    directXState.fontSamplerState->Release()
     directXState.blendState->Release()
 
     delete(directXState.iconsIndexesMapping)

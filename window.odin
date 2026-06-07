@@ -3,6 +3,7 @@ package main
 import "ui"
 
 import "core:strings"
+import "core:sync"
 import "core:thread"
 import "core:text/edit"
 
@@ -118,6 +119,12 @@ WindowData :: struct {
     debuggerCommand: DebuggerCommand,
     debuggerBrakepoints: [dynamic]SingleBrakepoint,
     currentDebuggerInstruction: SingleBrakepoint,
+    debuggerExePath: string, // last exe launched for debugging (used by F5 / Run)
+    debuggerLocals: [dynamic]DebuggerVariable, // locals snapshot at the current stop
+    debuggerLocalsMutex: sync.Mutex, // guards debuggerLocals (written by the debug thread, read by render)
+    debuggerCallStack: [dynamic]DebuggerStackFrame, // call stack snapshot at the current stop
+    debuggerCallStackMutex: sync.Mutex, // guards debuggerCallStack (written by the debug thread, read by render)
+    debuggerPaused: bool, // set by the debug thread while it's stopped waiting for a command (used by the cmd debugger to detect stops)
     //<
 }
 
@@ -243,6 +250,13 @@ createWindow :: proc(size: int2) {
 removeWindowData :: proc() {
     stopDebuggerThread()
 
+    freeDebuggerLocalsContents(&windowData.debuggerLocals)
+    delete(windowData.debuggerLocals)
+    freeDebuggerCallStackContents(&windowData.debuggerCallStack)
+    delete(windowData.debuggerCallStack)
+    delete(windowData.debuggerBrakepoints)
+    delete(windowData.debuggerExePath)
+
     for _, kerning in windowData.font.kerningTable {
         delete(kerning)
     }
@@ -261,10 +275,7 @@ removeWindowData :: proc() {
     strings.builder_destroy(&windowData.fileSearchStr)
     
     ui.clearContext(&windowData.uiContext)
-    delete(windowData.uiTextInputCtx.lines)
-
-    edit.destroy(&windowData.uiTextInputCtx.editorState)
-    strings.builder_destroy(&windowData.uiTextInputCtx.text)
+    // NOTE: lines/editorState/text are already freed by freeTextContext above; don't free them again.
     clearExplorer(windowData.explorer)
 
     // TODO: investigate, is this code block is needed

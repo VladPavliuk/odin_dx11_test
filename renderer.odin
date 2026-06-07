@@ -46,6 +46,7 @@ render :: proc() {
     ctx->OMSetDepthStencilState(directXState.depthStencilState, 0)
     ctx->RSSetState(directXState.rasterizerState)
 	ctx->PSSetSamplers(0, 1, &directXState->samplerState)
+	ctx->PSSetSamplers(1, 1, &directXState->fontSamplerState) // s1: linear/clamp sampler for the glyph atlas
 
     ctx->OMSetBlendState(directXState.blendState, nil, 0xFFFFFFFF)
 
@@ -305,30 +306,34 @@ renderUi :: proc() {
                 //     topOffset += f32(containerHeight) / 2.0 - textHeight / 2.0
                 // }
 
+                clipRectF := ui.toFloatRect(command.clipRect)
+
                 for char, lineCharIndex in command.text {
                     fontChar := font.chars[char]
 
-                    glyphSize: int2 = { fontChar.rect.right - fontChar.rect.left, fontChar.rect.top - fontChar.rect.bottom }
-                    glyphPosition: int2 = { i32(leftOffset) + fontChar.offset.x, i32(topOffset) - glyphSize.y - fontChar.offset.y }
+                    glyphSize := fontChar.size
+                    // NOTE: keep the X position fractional (no i32 truncation) so glyph
+                    // spacing stays even and the linear-sampled atlas renders sub-pixel offsets.
+                    glyphPosition: float2 = { leftOffset + fontChar.offset.x, topOffset - glyphSize.y - fontChar.offset.y }
 
                     leftOffset += fontChar.xAdvance
 
                     //> validate clipping
                     originalGlyphRect := ui.toRect(glyphPosition, glyphSize)
-                    glyphRect := ui.clipRect(command.clipRect, originalGlyphRect)
+                    glyphRect := ui.clipRect(clipRectF, originalGlyphRect)
                     if !ui.isValidRect(glyphRect) {
                         continue
                     }
-                    
-                    offset, scale := ui.normalizeClippedToOriginal(glyphRect, originalGlyphRect)
 
-                    glyphPosition, glyphSize = ui.fromRect(glyphRect)
+                    offset, scale := ui.normalizeClippedToOriginal(ui.toIntRect(glyphRect), ui.toIntRect(originalGlyphRect))
+
+                    clippedPosition, clippedSize := ui.fromRect(glyphRect)
                     //<
 
                     modelMatrix := getTransformationMatrix(
-                        { f32(glyphPosition.x), f32(glyphPosition.y), zIndex }, 
-                        { 0.0, 0.0, 0.0 }, 
-                        { f32(glyphSize.x), f32(glyphSize.y), 1.0 },
+                        { clippedPosition.x, clippedPosition.y, zIndex },
+                        { 0.0, 0.0, 0.0 },
+                        { clippedSize.x, clippedSize.y, 1.0 },
                     )
 
                     fontsList[charIndex] = FontGlyphGpu{
@@ -393,16 +398,16 @@ replace3SymbolsByDots :: proc(fontsList: []FontGlyphGpu, lastIndexToReplace: i32
     // TODO: improve it, right it just removes last 3 symbols and replace it by 3 dots
     // instead, try to find minimum amount of symbols that should be removed in order to fit 3 dots.
     startPosition := fontsList[lastIndexToReplace].targetTransformation[3][0]
-    glyphSize: int2 = { fontChar.rect.right - fontChar.rect.left, fontChar.rect.top - fontChar.rect.bottom }
+    glyphSize := fontChar.size
 
     for i: i32 = 0; i < 3; i += 1 {
-        glyphPosition: int2 = { i32(startPosition) + fontChar.offset.x, i32(yPosition) - glyphSize.y - fontChar.offset.y }
+        glyphPosition: float2 = { startPosition + fontChar.offset.x, yPosition - glyphSize.y - fontChar.offset.y }
         startPosition += fontChar.xAdvance
 
         modelMatrix := getTransformationMatrix(
-            { f32(glyphPosition.x), f32(glyphPosition.y), zIndex }, 
-            { 0.0, 0.0, 0.0 }, 
-            { f32(glyphSize.x), f32(glyphSize.y), 1.0 },
+            { glyphPosition.x, glyphPosition.y, zIndex },
+            { 0.0, 0.0, 0.0 },
+            { glyphSize.x, glyphSize.y, 1.0 },
         )
 
         fontsList[lastIndexToReplace + i] = FontGlyphGpu{
@@ -539,15 +544,15 @@ renderLine :: proc(text: string, font: ^FontData, position: int2, color: float4,
     for char, index in text {
         fontChar := font.chars[char]
 
-        glyphSize: int2 = { fontChar.rect.right - fontChar.rect.left, fontChar.rect.top - fontChar.rect.bottom }
-        glyphPosition: int2 = { i32(leftOffset) + fontChar.offset.x, i32(topOffset) - glyphSize.y - fontChar.offset.y }
+        glyphSize := fontChar.size
+        glyphPosition: float2 = { leftOffset + fontChar.offset.x, topOffset - glyphSize.y - fontChar.offset.y }
 
         modelMatrix := getTransformationMatrix(
-            { f32(glyphPosition.x), f32(glyphPosition.y), zIndex }, 
-            { 0.0, 0.0, 0.0 }, 
-            { f32(glyphSize.x), f32(glyphSize.y), 1.0 },
+            { glyphPosition.x, glyphPosition.y, zIndex },
+            { 0.0, 0.0, 0.0 },
+            { glyphSize.x, glyphSize.y, 1.0 },
         )
-        
+
         fontsList[index] = FontGlyphGpu{
             sourceRect = fontChar.rect,
             targetTransformation = modelMatrix, 
@@ -726,14 +731,11 @@ renderLineNumbers :: proc() {
             }
         }
 
-        // TODO: this is slow AF
-        for brakepoint in windowData.debuggerBrakepoints {
-            if existBrakepointInManager(fileTab.filePath, lineNumber) != -1 {
-                ui.pushCommand(&windowData.uiContext, ui.RectCommand{
-                    rect = lineRect,
-                    bgColor = RED_COLOR,
-                })
-            }
+        if existBrakepointInManager(fileTab.filePath, lineNumber) != -1 {
+            ui.pushCommand(&windowData.uiContext, ui.RectCommand{
+                rect = lineRect,
+                bgColor = RED_COLOR,
+            })
         }
 
         if windowData.currentDebuggerInstruction.line == lineNumber && 

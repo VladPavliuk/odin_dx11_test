@@ -1,6 +1,8 @@
 package main
 
 import "core:os"
+import "core:fmt"
+import "core:sync"
 import "core:strings"
 import "core:text/edit"
 import "core:path/filepath"
@@ -260,7 +262,7 @@ renderTopMenu :: proc() {
             })
 
             renderTextField(&windowData.uiContext, ui.TextField{
-                text = "C:\\projects\\mandelbrot_set_odin\\bin\\mandelbrot.exe",
+                text = windowData.debuggerExePath,
                 // text = "C:\\projects\\CppEditor\\CppEditor\\bin\\x64\\Debug\\CppEditor.exe",
                 position = { 0, 70 },
                 size = { 450, 30 },
@@ -306,26 +308,43 @@ renderDebugger :: proc() {
     }
 
     if actions, _ := ui.renderButton(&windowData.uiContext, ui.TextButton{
-        text = "Step",
+        text = "Step over",
         position = { 130, 300 },
         size = { 100, 25 },
         noBorder = true,
         bgColor = THEME_COLOR_2,
         hoverBgColor = THEME_COLOR_1,
     }); .SUBMIT in actions {
-        windowData.debuggerCommand = .STEP
+        windowData.debuggerCommand = .STEP_OVER
     }
 
     if actions, _ := ui.renderButton(&windowData.uiContext, ui.TextButton{
-        text = "Read",
+        text = "Step into",
         position = { 260, 300 },
         size = { 100, 25 },
         noBorder = true,
         bgColor = THEME_COLOR_2,
         hoverBgColor = THEME_COLOR_1,
     }) ; .SUBMIT in actions {
-        windowData.debuggerCommand = .READ
+        windowData.debuggerCommand = .STEP_INTO
     }
+
+    //> locals / watch values at the current stop
+    {
+        sync.mutex_lock(&windowData.debuggerLocalsMutex)
+        defer sync.mutex_unlock(&windowData.debuggerLocalsMutex)
+
+        localY: i32 = 270
+        for local in windowData.debuggerLocals {
+            ui.renderLabel(&windowData.uiContext, ui.Label{
+                text = fmt.tprintf("%s = %s", local.name, local.value),
+                position = { 0, localY },
+                color = WHITE_COLOR,
+            })
+            localY -= 20
+        }
+    }
+    //<
 }
 
 recalculateFileTabsContextRects :: proc() {
