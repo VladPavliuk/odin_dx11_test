@@ -131,7 +131,7 @@ initGpuResources :: proc() {
     directXState.pixelShaders[.RECTS_WITH_COLOR] = compilePixelShader(#load("./shaders/rects_with_color/ps.hlsl"))
     directXState.pixelShaders[.RECTS_WITH_IMAGE] = compilePixelShader(#load("./shaders/rects_with_image/ps.hlsl"))
     directXState.inputLayouts[.POSITION_AND_TEXCOORD] = inputLayout
-    
+
     VertexItem :: struct {
         position: float3,
         texcoord: float2,

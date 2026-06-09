@@ -39,6 +39,7 @@ FontData :: struct {
 	scale: f32,
 
     chars: map[rune]FontChar,
+    asciiChars: [128]FontChar, // fast-path mirror of `chars` for ASCII runes (see getFontChar)
     kerningTable: map[rune]map[rune]f32,
 }
 
@@ -173,10 +174,10 @@ BakeFontBitmapCustomChars :: proc(data: []byte, pixelHeight: f32, bitmap: []byte
     for char, i in runesList {
         pc := chardata[i]
 
-        fontData.chars[char] = FontChar{
-            // NOTE: y0 is the glyph's top row in the atlas (smaller texel-y) and y1
-            // the bottom row; the shader treats rect.bottom as the top row, rect.top
-            // as the bottom row, so map them accordingly.
+        // NOTE: y0 is the glyph's top row in the atlas (smaller texel-y) and y1
+        // the bottom row; the shader treats rect.bottom as the top row, rect.top
+        // as the bottom row, so map them accordingly.
+        fontChar := FontChar{
             rect = ui.Rect{
                 left = i32(pc.x0),
                 right = i32(pc.x1),
@@ -186,6 +187,11 @@ BakeFontBitmapCustomChars :: proc(data: []byte, pixelHeight: f32, bitmap: []byte
             offset = { pc.xoff, pc.yoff },
             size = { pc.xoff2 - pc.xoff, pc.yoff2 - pc.yoff },
             xAdvance = pc.xadvance,
+        }
+
+        fontData.chars[char] = fontChar
+        if char >= 0 && char < 128 { // keep the ASCII fast-path table in sync
+            fontData.asciiChars[char] = fontChar
         }
     }
 
@@ -209,6 +215,7 @@ BakeFontBitmapCustomChars :: proc(data: []byte, pixelHeight: f32, bitmap: []byte
     tabGlyph.size = spaceGlyph.size
 
     fontData.chars['\t'] = tabGlyph
+    fontData.asciiChars['\t'] = tabGlyph // '\t' (9) lives in the ASCII fast-path table too
 
     return fontData
 }
@@ -219,12 +226,23 @@ getTextHeight :: proc(font: rawptr) -> f32 {
     return (^FontData)(font).lineHeight
 }
 
+// Fast-path glyph lookup: editor text is overwhelmingly ASCII, so index a flat
+// array for those runes instead of hashing the map on every character. Non-ASCII
+// falls back to the map. Behaviour matches the map (zero value for unbaked glyphs).
+getFontChar :: #force_inline proc(font: ^FontData, char: rune) -> FontChar {
+    if char >= 0 && char < 128 {
+        return font.asciiChars[char]
+    }
+    return font.chars[char]
+}
+
 getTextWidth :: proc(text: string, font: rawptr) -> f32 {
     assert(font != nil)
+    fontData := (^FontData)(font)
     width: f32 = 0.0
 
     for char in text {
-        width += (^FontData)(font).chars[char].xAdvance
+        width += getFontChar(fontData, char).xAdvance
     }
 
     return width

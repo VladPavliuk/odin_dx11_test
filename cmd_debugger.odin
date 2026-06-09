@@ -90,6 +90,25 @@ runCmdDebugger :: proc() {
         case "si", "stepi":
             if !cmdEnsureRunning() { break }
             cmdResume(.STEP_INTO)
+        case "so", "finish", "out":
+            if !cmdEnsureRunning() { break }
+            cmdResume(.STEP_OUT)
+        case "i", "inst":
+            if !cmdEnsureRunning() { break }
+            cmdResume(.STEP_INSTRUCTION)
+        case "runto", "rt":
+            if !cmdEnsureRunning() { break }
+            cmdRunTo(rest)
+        case "reg", "regs", "registers":
+            cmdPrintRegisters()
+        case "x", "mem":
+            if !cmdExamineMemory(rest) {
+                fmt.println("usage: x <hexaddr> [count]")
+            }
+        case "set":
+            if !cmdSetVariable(rest) {
+                fmt.println("usage: set <local> <value>")
+            }
         case "p", "locals":
             cmdPrintLocals()
         case "bt", "k", "stack":
@@ -128,6 +147,12 @@ printCmdDebuggerHelp :: proc() {
     fmt.println("  c                 continue to the next breakpoint")
     fmt.println("  s | n             step over (run the line, including calls)")
     fmt.println("  si                step into (descend into a called function)")
+    fmt.println("  so | finish       step out (run until the current function returns)")
+    fmt.println("  i | inst          step one machine instruction")
+    fmt.println("  runto <line>      run to a line in the current file")
+    fmt.println("  reg | registers   print the CPU registers")
+    fmt.println("  x <hexaddr> [n]   examine n bytes of memory (hex + ascii)")
+    fmt.println("  set <local> <val> set an integer local's value")
     fmt.println("  p                 print locals at the current stop")
     fmt.println("  bt | k            print the call stack at the current stop")
     fmt.println("  w | where         print the current stop location")
@@ -246,4 +271,106 @@ cmdPrintCallStack :: proc() {
             fmt.printfln("  #%d %s", i, frame.function)
         }
     }
+}
+
+cmdPrintRegisters :: proc() {
+    r := windowData.debuggerRegisters
+    fmt.printfln("  rax=%016X  rbx=%016X  rcx=%016X  rdx=%016X", r.rax, r.rbx, r.rcx, r.rdx)
+    fmt.printfln("  rsi=%016X  rdi=%016X  rbp=%016X  rsp=%016X", r.rsi, r.rdi, r.rbp, r.rsp)
+    fmt.printfln("  r8 =%016X  r9 =%016X  r10=%016X  r11=%016X", r.r8, r.r9, r.r10, r.r11)
+    fmt.printfln("  r12=%016X  r13=%016X  r14=%016X  r15=%016X", r.r12, r.r13, r.r14, r.r15)
+    fmt.printfln("  rip=%016X  rflags=%08X", r.rip, r.rflags)
+}
+
+// "x <hexaddr> [count]" - hex + ascii dump of the debuggee's memory.
+cmdExamineMemory :: proc(arg: string) -> bool {
+    fields := strings.fields(arg, context.temp_allocator)
+    if len(fields) == 0 { return false }
+
+    address := uintptr(parseHexAddress(fields[0]))
+    count := 64
+    if len(fields) >= 2 {
+        if n, ok := strconv.parse_int(fields[1]); ok && n > 0 { count = min(n, 4096) }
+    }
+
+    buf := make([]u8, count, context.temp_allocator)
+    read, ok := readDebuggerMemory(address, buf)
+    if !ok {
+        fmt.println("<unreadable>")
+        return true
+    }
+
+    for i := 0; i < int(read); i += 16 {
+        b := strings.builder_make(context.temp_allocator)
+        fmt.sbprintf(&b, "  %012X  ", u64(address) + u64(i))
+        for j in 0 ..< 16 {
+            if i + j < int(read) { fmt.sbprintf(&b, "%02X ", buf[i + j]) } else { strings.write_string(&b, "   ") }
+        }
+        strings.write_string(&b, " ")
+        for j in 0 ..< 16 {
+            if i + j < int(read) {
+                c := buf[i + j]
+                strings.write_byte(&b, (c >= 32 && c < 127) ? c : byte('.'))
+            }
+        }
+        fmt.println(strings.to_string(b))
+    }
+    return true
+}
+
+// "set <local> <value>" - writes an integer into a frame-relative local.
+cmdSetVariable :: proc(arg: string) -> bool {
+    fields := strings.fields(arg, context.temp_allocator)
+    if len(fields) < 2 { return false }
+
+    value, vok := strconv.parse_i64(fields[1])
+    if !vok { value = i64(parseHexAddress(fields[1])) } // accept hex too
+
+    address: uintptr = 0
+    size: u32 = 0
+    found := false
+    sync.mutex_lock(&windowData.debuggerLocalsMutex)
+    for v in windowData.debuggerLocals {
+        if v.name == fields[0] { address = v.address; size = v.size; found = true; break }
+    }
+    sync.mutex_unlock(&windowData.debuggerLocalsMutex)
+
+    if !found || address == 0 {
+        fmt.printfln("no such local: %s", fields[0])
+        return true
+    }
+    if writeDebuggerInt(address, value, int(size)) {
+        // refresh the cached snapshot so a following `p` shows the new value, not the value at the stop
+        sync.mutex_lock(&windowData.debuggerLocalsMutex)
+        for &v in windowData.debuggerLocals {
+            if v.name == fields[0] {
+                delete(v.value)
+                v.value = readDebuggerValue(windowData.debuggerProcessHandler, address, u64(size))
+                break
+            }
+        }
+        sync.mutex_unlock(&windowData.debuggerLocalsMutex)
+        fmt.printfln("%s = %d", fields[0], value)
+    } else {
+        fmt.println("write failed")
+    }
+    return true
+}
+
+// "runto <line>" - run to the given line in the file we're currently stopped in.
+cmdRunTo :: proc(arg: string) {
+    line, ok := strconv.parse_int(strings.trim_space(arg))
+    if !ok {
+        fmt.println("usage: runto <line>")
+        return
+    }
+    file := windowData.currentDebuggerInstruction.filePath
+    if file == "" {
+        fmt.println("no current source location")
+        return
+    }
+    delete(windowData.debuggerRunToFile)
+    windowData.debuggerRunToFile = strings.clone(file)
+    windowData.debuggerRunToLine = i32(line)
+    cmdResume(.RUN_TO)
 }

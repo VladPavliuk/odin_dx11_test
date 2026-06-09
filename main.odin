@@ -4,6 +4,7 @@ import "core:text/edit"
 import "core:time"
 import "core:mem"
 import "core:thread"
+import "core:strings"
 import win32 "core:sys/windows"
 
 // Entry point. Two front-ends share the same debugger core: the normal editor (GUI) and a
@@ -27,7 +28,7 @@ runEditor :: proc() {
     default_context = context
 
     createWindow({ 1000, 1000 })
-    
+
     // append(&windowData.debuggerBrakepoints, SingleBrakepoint{
     //     filePath = "C:\\projects\\cpp_test_cmd\\cpp_test_cmd\\main.cpp", 
     //     line = 32,
@@ -40,9 +41,9 @@ runEditor :: proc() {
     // runDebugProcess("C:\\projects\\CppEditor\\CppEditor\\bin\\x64\\Debug\\CppEditor.exe")
 
     initDirectX()
-    
+
     initGpuResources()
-    
+
     // set default editable context
     switchInputContextToEditor()
 
@@ -65,11 +66,24 @@ runEditor :: proc() {
         }
 
         if .F10 in inputState.wasPressedKeys {
-            windowData.debuggerCommand = .STEP_OVER
+            // Ctrl+F10 = run to the editor cursor's line; plain F10 = step over (matches Visual Studio).
+            if isCtrlPressed() && windowData.debuggerThread != nil {
+                tab := getActiveTab()
+                ctx := getActiveTabContext()
+                if tab != nil && ctx != nil && tab.filePath != "" {
+                    delete(windowData.debuggerRunToFile)
+                    windowData.debuggerRunToFile = strings.clone(tab.filePath)
+                    windowData.debuggerRunToLine = ctx.cursorLineIndex + 1 // cursorLineIndex is 0-based
+                    windowData.debuggerCommand = .RUN_TO
+                }
+            } else {
+                windowData.debuggerCommand = .STEP_OVER
+            }
         }
 
         if .F11 in inputState.wasPressedKeys {
-            windowData.debuggerCommand = .STEP_INTO
+            // Shift+F11 = step out, plain F11 = step into (matches Visual Studio).
+            windowData.debuggerCommand = isShiftPressed() ? .STEP_OUT : .STEP_INTO
         }
 
         // NOTE: For some reasons if mouse double click on laptop touchpad happened, windows sends WM_LBUTTONDOWN and WM_LBUTTONUP at the same time??!
@@ -91,7 +105,13 @@ runEditor :: proc() {
 
         render()
 
-        wasFileModifiedExternally(getActiveTab())
+        // Stat the active file periodically rather than every frame; at vsync rate the
+        // per-frame stat is a pure syscall cost with no benefit.
+        if windowData.sinceFileModifiedCheck > windowData.fileModifiedCheckInterval {
+            wasFileModifiedExternally(getActiveTab())
+            windowData.sinceFileModifiedCheck = 0.0
+        }
+        windowData.sinceFileModifiedCheck += windowData.delta
 
         if windowData.sinceExplorerSync > windowData.explorerSyncInterval {
             validateExplorerItems(&windowData.explorer)

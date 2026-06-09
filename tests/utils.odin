@@ -222,6 +222,30 @@ clickMouse_Single :: proc(x, y: i32) {
     win32.SendInput(u32(len(input)), raw_data(input[:]), size_of(win32.INPUT))
 }
 
+// Screen-pixel center of debug control button `index` (0 = Continue .. 3 = Step out), derived from the
+// renderer's own layout helper so the test never duplicates (and drifts from) the panel layout.
+debugButtonScreenCenter :: proc(hwnd: win32.HWND, index: i32) -> (i32, i32) {
+    size := main.windowData.size
+    pos := main.debugControlButtonPosition(index) // bottom-left, centered UI coords (+y up)
+    btn := main.DEBUG_CONTROL_BUTTON_SIZE
+    centerX := pos.x + btn.x / 2
+    centerY := pos.y + btn.y / 2
+
+    // invert screenToDirectXCoords: client px = (ux + w/2, h/2 - uy)
+    pt := win32.POINT{ centerX + size.x / 2, size.y / 2 - centerY }
+    win32.ClientToScreen(hwnd, &pt)
+    return pt.x, pt.y
+}
+
+// Latches hover onto a debug button (so it's `hot`), then presses it; mirrors how a user clicks it.
+clickDebugButton :: proc(hwnd: win32.HWND, index: i32) {
+    x, y := debugButtonScreenCenter(hwnd, index)
+    moveMouse(x, y)
+    time.sleep(120_000_000) // let hotId latch onto the button before the press
+    clickMouse_Single(x, y)
+    time.sleep(120_000_000) // let the SUBMIT frame run
+}
+
 moveMouse :: proc(x, y: i32) {
     stopIfAppNotActive()
 

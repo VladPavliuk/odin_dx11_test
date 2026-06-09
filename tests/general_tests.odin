@@ -37,6 +37,41 @@ just_run_and_close :: proc(t: ^testing.T) {
     testing.expect_value(t, strings.to_string(main.getActiveTabContext().text), text)
 }
 
+// Clicking each debug-panel control button dispatches its own command. This is also the regression
+// test for the id-collision bug: when the four buttons shared a #caller_location-derived id they all
+// reported `hot`/SUBMIT together, so every click set the last button's command (Step out).
+@(test)
+debug_panel_buttons_dispatch_commands :: proc(t: ^testing.T) {
+    os.remove(main.editorStateFilePath)
+
+    appThread, windowData := startApp(proc(windowData: ^main.WindowData) -> bool {
+        return windowData.windowCreated
+    })
+    defer stopApp(appThread, windowData.parentHwnd)
+
+    // Show the docked panel without launching a real debuggee: the buttons render and stay clickable,
+    // and with no debug loop running nothing consumes the command we're asserting.
+    sync.atomic_store(&windowData.debugPanelForceVisible, true)
+    time.sleep(200_000_000) // let a few frames render and lay the panel out
+
+    Case :: struct { index: i32, expected: main.DebuggerCommand }
+    cases := []Case{
+        { 0, .CONTINUE },
+        { 1, .STEP_OVER },
+        { 2, .STEP_INTO },
+        { 3, .STEP_OUT },
+        { 4, .STEP_INSTRUCTION },
+    }
+
+    for c in cases {
+        sync.atomic_store(&windowData.debuggerCommand, .NONE)
+
+        clickDebugButton(windowData.parentHwnd, c.index)
+
+        testing.expect_value(t, sync.atomic_load(&windowData.debuggerCommand), c.expected)
+    }
+}
+
 @(test)
 basic_file_search :: proc(t: ^testing.T) {
     os.remove(main.editorStateFilePath)

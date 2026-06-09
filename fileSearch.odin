@@ -142,7 +142,7 @@ renderFoundSearchTerms :: proc(indexes: []int, serchTerm: string) {
             for _ in 0..<serchTermLength {
                 char, charSize := utf8.decode_rune(textToSearch[byteIndex:])
                 defer byteIndex += i32(charSize)
-                fontChar := windowData.font.chars[char]
+                fontChar := getFontChar(&windowData.font, char)
 
                 size += fontChar.xAdvance
             }

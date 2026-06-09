@@ -245,11 +245,14 @@ addEmptyTab :: proc() {
     addTab(strings.clone("(empty)"))
 }
 
-addTab :: proc(title: string, filePath := "", text := "", lastUpdatedAt: i64 = 0) {
+addTab :: proc(title: string, filePath := "", text := "", lastUpdatedAt: i64 = 0, isReadOnly := false) {
+    ctx := createEmptyTextContext(text)
+    ctx.isReadOnly = isReadOnly
+
     tab := FileTab{
         name = title,
         filePath = filePath,
-        ctx = createEmptyTextContext(text),
+        ctx = ctx,
         isSaved = true,
         lastUpdatedAt = lastUpdatedAt,
     }
@@ -269,7 +272,7 @@ loadFileFromExplorerIntoNewTab :: proc() {
 }
 
 loadFileIntoNewTab :: proc(filePath: string) {
-    fileText := loadTextFile(filePath)
+    fileText, isReadOnly := loadFileForTab(filePath)
 
     // find if any tab is already associated with opened file
     tabIndex := -1
@@ -301,7 +304,7 @@ loadFileIntoNewTab :: proc(filePath: string) {
     //     return
     // }
 
-    addTab(strings.clone(filepath.base(filePath)), strings.clone(filePath), fileText, getCurrentUnixTime())
+    addTab(strings.clone(filepath.base(filePath)), strings.clone(filePath), fileText, getCurrentUnixTime(), isReadOnly)
 }
 
 getFileTabIndex :: proc(tabs: []FileTab, filePath: string) -> int {
@@ -369,10 +372,11 @@ wasFileModifiedExternally :: proc(tab: ^FileTab) {
 
     switch showOsConfirmMessage("Edi the editor", "File was modified outside the editor, override your version?") {
     case .YES:
-        newText := loadTextFile(tab.filePath)
+        newText, isReadOnly := loadFileForTab(tab.filePath)
 
         freeTextContext(tab.ctx)
         tab.ctx = createEmptyTextContext(newText)
+        tab.ctx.isReadOnly = isReadOnly
         tab.lastUpdatedAt = getCurrentUnixTime()
 
         switchInputContextToEditor()

@@ -101,16 +101,18 @@ renderTopMenu :: proc() {
                 padding = ui.Rect{ top = 2, bottom = 3, left = 20, right = 10, },
             },
         }); .SUBMIT in actions {
-            editorState := &getActiveTabContext().editorState
+            editorCtx := getActiveTabContext()
+            editorState := &editorCtx.editorState
+            canModify := !editorCtx.isReadOnly // read-only tabs allow Copy only
             switch selected {
-            case 0: edit.perform_command(editorState, edit.Command.Undo)
-            case 1: edit.perform_command(editorState, edit.Command.Redo)
-            case 3: edit.perform_command(editorState, edit.Command.Cut)
+            case 0: if canModify { edit.perform_command(editorState, edit.Command.Undo) }
+            case 1: if canModify { edit.perform_command(editorState, edit.Command.Redo) }
+            case 3: if canModify { edit.perform_command(editorState, edit.Command.Cut) }
             case 4:
                 if edit.has_selection(editorState) {
                     edit.perform_command(editorState, edit.Command.Copy)
                 }
-            case 5: edit.perform_command(editorState, edit.Command.Paste)
+            case 5: if canModify { edit.perform_command(editorState, edit.Command.Paste) }
             }
         }
         topItemPosition.x += 60
@@ -293,65 +295,277 @@ renderTopMenu :: proc() {
 
         topItemPosition.x += 60
     }
+
+    { // Read-only indicator (right side of the menu bar) for big files opened in preview mode
+        activeCtx := getActiveTabContext()
+        if activeCtx != nil && activeCtx.isReadOnly {
+            indicatorText := "READ ONLY"
+            textWidth := getTextWidth(indicatorText, &windowData.font)
+            textHeight := windowData.font.lineHeight
+            padX: i32 = 8
+
+            right := windowData.size.x / 2 - 10
+            left := right - i32(textWidth) - 2 * padX
+            top := windowData.size.y / 2
+            bottom := top - fileMenuHeight
+
+            ui.pushCommand(&windowData.uiContext, ui.RectCommand{
+                rect = ui.Rect{ top = top, bottom = bottom, left = left, right = right },
+                bgColor = float4{ 0.85, 0.4, 0.1, 1.0 },
+            })
+
+            ui.renderLabel(&windowData.uiContext, ui.Label{
+                text = indicatorText,
+                position = { left + padX, bottom + i32((f32(fileMenuHeight) - textHeight) / 2.0) },
+                color = WHITE_COLOR,
+            })
+        }
+    }
 }
 
+DEBUG_PANEL_HEIGHT :: 260 // height of the docked bottom debug panel (also reserved as editor padding)
+DEBUG_CONTROL_BUTTON_SIZE :: int2{ 90, 24 }
+
+// Bottom-left position (centered UI coords, +y up) of debug control button `index` (0 = Continue ..
+// 3 = Step out). Shared with the UI tests so they can locate the buttons without duplicating layout.
+debugControlButtonPosition :: proc(index: i32) -> int2 {
+    pad: i32 = 10
+    gap: i32 = 6
+    panelTop := -windowData.size.y / 2 + DEBUG_PANEL_HEIGHT
+    return {
+        -windowData.size.x / 2 + pad + index * (DEBUG_CONTROL_BUTTON_SIZE.x + gap),
+        panelTop - 8 - DEBUG_CONTROL_BUTTON_SIZE.y,
+    }
+}
+
+// The docked debug panel at the bottom of the window, shown only while a debug session is active.
+// Hosts the run controls, the current stop location, the call stack, locals, and a live view of the
+// debuggee's process memory (RAM).
 renderDebugger :: proc() {
-    if actions, _ := ui.renderButton(&windowData.uiContext, ui.TextButton{
-        text = "Continue",
-        position = { 0, 300 },
-        size = { 100, 25 },
-        noBorder = true,
-        bgColor = THEME_COLOR_2,
-        hoverBgColor = THEME_COLOR_1,
-    }); .SUBMIT in actions {
-        windowData.debuggerCommand = .CONTINUE
-    }
+    panelHeight := windowData.debugPanelHeight
+    if panelHeight <= 0 { panelHeight = DEBUG_PANEL_HEIGHT }
 
-    if actions, _ := ui.renderButton(&windowData.uiContext, ui.TextButton{
-        text = "Step over",
-        position = { 130, 300 },
-        size = { 100, 25 },
-        noBorder = true,
-        bgColor = THEME_COLOR_2,
-        hoverBgColor = THEME_COLOR_1,
-    }); .SUBMIT in actions {
-        windowData.debuggerCommand = .STEP_OVER
-    }
+    panelBottom := -windowData.size.y / 2
+    panelLeft := -windowData.size.x / 2
+    panelRight := windowData.size.x / 2
+    panelTop := panelBottom + panelHeight
 
-    if actions, _ := ui.renderButton(&windowData.uiContext, ui.TextButton{
-        text = "Step into",
-        position = { 260, 300 },
-        size = { 100, 25 },
-        noBorder = true,
-        bgColor = THEME_COLOR_2,
-        hoverBgColor = THEME_COLOR_1,
-    }) ; .SUBMIT in actions {
-        windowData.debuggerCommand = .STEP_INTO
-    }
+    pad: i32 = 10
+    rowH := i32(windowData.font.lineHeight)
 
-    //> locals / watch values at the current stop
+    panelRect := ui.Rect{ top = panelTop, bottom = panelBottom, left = panelLeft, right = panelRight }
+    // Swallow mouse input over the panel so clicks/scroll don't reach the editor behind it.
+    ui.putEmptyElement(&windowData.uiContext, panelRect)
+    ui.pushCommand(&windowData.uiContext, ui.RectCommand{ rect = panelRect, bgColor = DARKER_GRAY_COLOR })
+    ui.pushCommand(&windowData.uiContext, ui.BorderRectCommand{ rect = panelRect, color = BLACK_COLOR, thikness = 1 })
+
+    //> run controls
+    // Distinct customIds: all four share a call site, so they'd otherwise share a
+    // #caller_location-derived id and hover/highlight (and submit) as one.
+    renderDebugControlButton("Continue",  debugControlButtonPosition(0), DEBUG_CONTROL_BUTTON_SIZE, .CONTINUE, 1)
+    renderDebugControlButton("Step over", debugControlButtonPosition(1), DEBUG_CONTROL_BUTTON_SIZE, .STEP_OVER, 2)
+    renderDebugControlButton("Step into", debugControlButtonPosition(2), DEBUG_CONTROL_BUTTON_SIZE, .STEP_INTO, 3)
+    renderDebugControlButton("Step out",  debugControlButtonPosition(3), DEBUG_CONTROL_BUTTON_SIZE, .STEP_OUT, 4)
+    renderDebugControlButton("Step inst", debugControlButtonPosition(4), DEBUG_CONTROL_BUTTON_SIZE, .STEP_INSTRUCTION, 5)
+    //<
+
+    //> status line
+    statusY := debugControlButtonPosition(0).y - 8 - rowH
+    statusText: string
+    if sync.atomic_load(&windowData.debuggerPaused) {
+        instr := windowData.currentDebuggerInstruction
+        if instr.filePath != "" {
+            statusText = fmt.tprintf("Paused at %s:%d", filepath.base(instr.filePath), instr.line)
+        } else {
+            statusText = "Paused"
+        }
+    } else {
+        statusText = "Running..."
+    }
+    ui.renderLabel(&windowData.uiContext, ui.Label{ text = statusText, position = { panelLeft + pad, statusY }, color = WHITE_COLOR })
+
+    // compact registers line (the full register set is in the cmd debugger's `reg` command)
+    regs := windowData.debuggerRegisters
+    registersY := statusY - rowH - 2
+    ui.renderLabel(&windowData.uiContext, ui.Label{
+        text = fmt.tprintf("rip=%X  rsp=%X  rbp=%X  rax=%X  rbx=%X", regs.rip, regs.rsp, regs.rbp, regs.rax, regs.rbx),
+        position = { panelLeft + pad, registersY },
+        color = LIGHT_GRAY_COLOR,
+    })
+    //<
+
+    columnsTop := registersY - 10 - rowH
+    columnBottom := panelBottom + pad
+
+    // Right-anchor the memory column (its rows are wide); split the remaining left space between the
+    // call stack and the locals.
+    memoryWidth: i32 = 440
+    memoryLeft := panelRight - pad - memoryWidth
+    leftRegionRight := memoryLeft - pad
+    callStackLeft := panelLeft + pad
+    localsLeft := callStackLeft + max(160, (leftRegionRight - callStackLeft) / 2)
+
+    //> call stack
+    {
+        sync.mutex_lock(&windowData.debuggerCallStackMutex)
+        defer sync.mutex_unlock(&windowData.debuggerCallStackMutex)
+
+        y := columnsTop
+        ui.renderLabel(&windowData.uiContext, ui.Label{ text = "Call stack", position = { callStackLeft, y }, color = THEME_COLOR_2 })
+        y -= rowH + 2
+        for frame in windowData.debuggerCallStack {
+            if y < columnBottom { break }
+            label: string
+            if frame.filePath != "" {
+                label = fmt.tprintf("%s  (%s:%d)", frame.function, filepath.base(frame.filePath), frame.line)
+            } else {
+                label = frame.function
+            }
+            ui.renderLabel(&windowData.uiContext, ui.Label{ text = label, position = { callStackLeft, y }, color = WHITE_COLOR })
+            y -= rowH
+        }
+    }
+    //<
+
+    //> locals
     {
         sync.mutex_lock(&windowData.debuggerLocalsMutex)
         defer sync.mutex_unlock(&windowData.debuggerLocalsMutex)
 
-        localY: i32 = 270
+        y := columnsTop
+        ui.renderLabel(&windowData.uiContext, ui.Label{ text = "Locals", position = { localsLeft, y }, color = THEME_COLOR_2 })
+        y -= rowH + 2
         for local in windowData.debuggerLocals {
+            if y < columnBottom { break }
             ui.renderLabel(&windowData.uiContext, ui.Label{
                 text = fmt.tprintf("%s = %s", local.name, local.value),
-                position = { 0, localY },
+                position = { localsLeft, y },
                 color = WHITE_COLOR,
             })
-            localY -= 20
+            y -= rowH
         }
     }
     //<
+
+    renderDebuggerMemoryView(memoryLeft, columnsTop, columnBottom, rowH)
+}
+
+// One of the docked panel's run-control buttons; clicking it queues the given command for the debug
+// loop. `customId` must be unique per button: they share a call site, so the id is otherwise identical.
+renderDebugControlButton :: proc(text: string, position: int2, size: int2, command: DebuggerCommand, customId: i32) {
+    if actions, _ := ui.renderButton(&windowData.uiContext, ui.TextButton{
+        text = text,
+        position = position,
+        size = size,
+        noBorder = true,
+        bgColor = THEME_COLOR_2,
+        hoverBgColor = THEME_COLOR_1,
+    }, customId); .SUBMIT in actions {
+        windowData.debuggerCommand = command
+    }
+}
+
+// The memory (RAM) viewer column: an editable hex address field over a live hex+ascii dump of the
+// debuggee's memory. An empty/invalid address follows the current stack pointer (RSP at the last stop).
+renderDebuggerMemoryView :: proc(left, top, bottom, rowH: i32) {
+    y := top
+
+    rsp := sync.atomic_load(&windowData.debuggerStackPointer)
+    effectiveAddress := windowData.debuggerMemoryAddress != 0 ? windowData.debuggerMemoryAddress : rsp
+
+    headerText: string
+    if windowData.debuggerMemoryAddress != 0 {
+        headerText = fmt.tprintf("Memory @ %012X", effectiveAddress)
+    } else {
+        headerText = fmt.tprintf("Memory @ %012X (rsp)", effectiveAddress)
+    }
+    ui.renderLabel(&windowData.uiContext, ui.Label{ text = headerText, position = { left, y }, color = THEME_COLOR_2 })
+    y -= rowH + 2
+
+    // Editable address field (own row, so it never collides with the header). Mirrors the file-search
+    // pattern: read the live edit back out of the shared input context while focused.
+    fieldActions, _ := renderTextField(&windowData.uiContext, ui.TextField{
+        text = strings.to_string(windowData.debuggerMemoryAddressInput),
+        position = { left, y - 4 },
+        size = { 220, rowH + 6 },
+        bgColor = LIGHT_GRAY_COLOR,
+    })
+    if .FOCUSED in fieldActions && windowData.wasTextContextModified {
+        strings.builder_reset(&windowData.debuggerMemoryAddressInput)
+        strings.write_string(&windowData.debuggerMemoryAddressInput, strings.to_string(windowData.uiTextInputCtx.text))
+        windowData.debuggerMemoryAddress = parseHexAddress(strings.to_string(windowData.debuggerMemoryAddressInput))
+    }
+
+    y -= rowH + 14
+
+    buf: [80]u8 // 10 rows of 8 bytes
+    bytesRead: uint
+    readOk := false
+    if effectiveAddress != 0 && windowData.debuggerProcessHandler != nil {
+        if win32.ReadProcessMemory(windowData.debuggerProcessHandler, win32.LPCVOID(uintptr(effectiveAddress)),
+            raw_data(buf[:]), uint(len(buf)), &bytesRead) && bytesRead > 0 {
+            readOk = true
+        }
+    }
+
+    if !readOk {
+        ui.renderLabel(&windowData.uiContext, ui.Label{ text = "<unreadable>", position = { left, y }, color = LIGHT_GRAY_COLOR })
+        return
+    }
+
+    BYTES_PER_ROW :: 8
+    rows := int(bytesRead) / BYTES_PER_ROW
+    for r in 0 ..< rows {
+        if y < bottom { break }
+        rowAddress := effectiveAddress + u64(r * BYTES_PER_ROW)
+        ui.renderLabel(&windowData.uiContext, ui.Label{
+            text = formatMemoryRow(rowAddress, buf[r * BYTES_PER_ROW:(r + 1) * BYTES_PER_ROW]),
+            position = { left, y },
+            color = WHITE_COLOR,
+        })
+        y -= rowH
+    }
+}
+
+// "<addr>  HH HH .. HH  <ascii>" for one row of a memory dump (temp-allocated, valid for this frame).
+formatMemoryRow :: proc(rowAddress: u64, bytes: []u8) -> string {
+    b := strings.builder_make(context.temp_allocator)
+    fmt.sbprintf(&b, "%012X  ", rowAddress)
+    for v in bytes { fmt.sbprintf(&b, "%02X ", v) }
+    strings.write_byte(&b, ' ')
+    for v in bytes { strings.write_byte(&b, (v >= 32 && v < 127) ? v : byte('.')) }
+    return strings.to_string(b)
+}
+
+// Parses a hex string (optional "0x"/"0X" prefix, ignores spaces/underscores). Returns 0 for empty or
+// invalid input, which the memory viewer treats as "follow the stack pointer".
+parseHexAddress :: proc(s: string) -> u64 {
+    t := strings.trim_space(s)
+    if strings.has_prefix(t, "0x") || strings.has_prefix(t, "0X") { t = t[2:] }
+
+    value: u64 = 0
+    seenDigit := false
+    for ch in t {
+        digit: u64
+        switch ch {
+        case '0' ..= '9': digit = u64(ch - '0')
+        case 'a' ..= 'f': digit = u64(ch - 'a') + 10
+        case 'A' ..= 'F': digit = u64(ch - 'A') + 10
+        case ' ', '_':    continue
+        case:             return seenDigit ? value : 0 // stop at the first invalid character
+        }
+        value = value * 16 + digit
+        seenDigit = true
+    }
+    return value
 }
 
 recalculateFileTabsContextRects :: proc() {
     for fileTab in windowData.fileTabs {
         fileTab.ctx.rect = ui.Rect{
             top = windowData.size.y / 2 - windowData.editorPadding.top,
-            bottom = -windowData.size.y / 2 + windowData.editorPadding.bottom,
+            // debugPanelHeight lifts the editor's bottom edge above the docked debug panel (0 when idle)
+            bottom = -windowData.size.y / 2 + windowData.editorPadding.bottom + windowData.debugPanelHeight,
             left = -windowData.size.x / 2 + windowData.editorPadding.left,
             right = windowData.size.x / 2 - windowData.editorPadding.right,
         }

@@ -126,6 +126,34 @@ walkFunctionTableAccess :: proc "std" (hProcess: win32.HANDLE, addrBase: win32.D
     return nil
 }
 
+// Returns the address the current function will return to (its caller's resume point), via a single
+// StackWalk64 unwind step using the same .pdata-driven logic as the full call-stack walk. Step-out
+// plants a breakpoint there to run out of the current frame. ok=false when there's no caller to return
+// to (outermost frame) or the unwind produced no return address.
+returnAddressOf :: proc(process: win32.HANDLE, hThread: win32.HANDLE, threadCtx: win32.CONTEXT, modules: []DebuggerModule) -> (returnAddress: uintptr, ok: bool) {
+    walkProcess = process
+    walkModules = modules
+
+    ctx := threadCtx
+
+    frame: STACKFRAME64
+    frame.AddrPC.Offset = u64(ctx.Rip)
+    frame.AddrPC.Mode = ADDR_MODE_FLAT
+    frame.AddrFrame.Offset = u64(ctx.Rbp)
+    frame.AddrFrame.Mode = ADDR_MODE_FLAT
+    frame.AddrStack.Offset = u64(ctx.Rsp)
+    frame.AddrStack.Mode = ADDR_MODE_FLAT
+
+    // The first StackWalk64 step describes the current frame and fills in AddrReturn (the caller's PC).
+    if !StackWalk64(IMAGE_FILE_MACHINE_AMD64, process, hThread, &frame, &ctx,
+        nil, walkFunctionTableAccess, walkGetModuleBase, nil) {
+        return 0, false
+    }
+
+    ret := uintptr(frame.AddrReturn.Offset)
+    return ret, ret != 0
+}
+
 // Walks the paused thread's stack and publishes a resolved snapshot to windowData.debuggerCallStack.
 // Runs on the debug thread while the debuggee is stopped (memory is read via ReadProcessMemory).
 // `threadCtx` is copied because StackWalk64 mutates it as it unwinds.

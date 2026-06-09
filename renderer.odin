@@ -309,7 +309,7 @@ renderUi :: proc() {
                 clipRectF := ui.toFloatRect(command.clipRect)
 
                 for char, lineCharIndex in command.text {
-                    fontChar := font.chars[char]
+                    fontChar := getFontChar(font, char)
 
                     glyphSize := fontChar.size
                     // NOTE: keep the X position fractional (no i32 truncation) so glyph
@@ -391,7 +391,7 @@ renderUi :: proc() {
 
 @(private="file")
 replace3SymbolsByDots :: proc(fontsList: []FontGlyphGpu, lastIndexToReplace: i32, yPosition: f32, zIndex: f32, color: float4, font: ^FontData) {
-    fontChar := font.chars['.']
+    fontChar := getFontChar(font, '.')
     lastIndexToReplace := lastIndexToReplace
     lastIndexToReplace -= 2
 
@@ -419,6 +419,14 @@ replace3SymbolsByDots :: proc(fontsList: []FontGlyphGpu, lastIndexToReplace: i32
 }
 
 uiStaff :: proc() {
+    // Reserve (or release) the bottom strip for the debug panel as a session starts/ends, reflowing
+    // the editor so its text and scrollbar sit above the panel instead of behind it.
+    desiredDebugPanelHeight: i32 = windowData.debuggerThread != nil ? DEBUG_PANEL_HEIGHT : 0
+    if windowData.debugPanelHeight != desiredDebugPanelHeight {
+        windowData.debugPanelHeight = desiredDebugPanelHeight
+        recalculateFileTabsContextRects()
+    }
+
     ui.beginUi(&windowData.uiContext, windowData.maxZIndex / 2.0)
     // stopTimer()
     renderEditorContent() // 2620.899 ms
@@ -430,7 +438,7 @@ uiStaff :: proc() {
     renderEditorFileTabs()
     renderFolderExplorer()
 
-    if windowData.debuggerThread != nil {
+    if windowData.debuggerThread != nil || windowData.debugPanelForceVisible {
         renderDebugger()
     }
 
@@ -439,6 +447,8 @@ uiStaff :: proc() {
     }
 
     renderTopMenu()
+
+    renderDebuggerHover() // last: the DataTip sits above the editor and panels
     //<
 
     ui.endUi(&windowData.uiContext, windowData.delta)
@@ -542,7 +552,7 @@ renderLine :: proc(text: string, font: ^FontData, position: int2, color: float4,
     }
 
     for char, index in text {
-        fontChar := font.chars[char]
+        fontChar := getFontChar(font, char)
 
         glyphSize := fontChar.size
         glyphPosition: float2 = { leftOffset + fontChar.offset.x, topOffset - glyphSize.y - fontChar.offset.y }
@@ -629,7 +639,7 @@ fillTextBuffer :: proc(ctx: ^EditableTextContext, color: float4, zIndex: f32) ->
     }
     
     for glyphIndex, glyph in ctx.glyphsLocations {
-        fontChar := windowData.font.chars[glyph.char]
+        fontChar := getFontChar(&windowData.font, glyph.char)
 
         if hasSelection && glyphIndex >= selectionRange.x && glyphIndex < selectionRange.y {
             //> validate clipping

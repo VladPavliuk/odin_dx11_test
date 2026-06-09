@@ -42,6 +42,9 @@ DebuggerCommand :: enum {
     CONTINUE,
     STEP_OVER, // run the current source line, stepping over calls
     STEP_INTO, // advance one source line, descending into calls that have source info
+    STEP_OUT,  // run until the current function returns to its caller
+    STEP_INSTRUCTION, // execute exactly one machine instruction
+    RUN_TO,    // run until debuggerRunToFile:debuggerRunToLine (or an earlier breakpoint)
 }
 
 // How a source-level step is currently progressing on the debug thread (driven by the stepping
@@ -50,6 +53,15 @@ StepMode :: enum {
     None,
     Over,
     Into,
+    Out,
+    Instruction, // single-step exactly one machine instruction, then stop
+}
+
+// Snapshot of the paused thread's x64 general-purpose registers, captured at each stop.
+DebuggerRegisters :: struct {
+    rax, rbx, rcx, rdx, rsi, rdi, rbp, rsp:   u64,
+    r8, r9, r10, r11, r12, r13, r14, r15:     u64,
+    rip, rflags:                              u64,
 }
 
 SingleBrakepoint :: struct {
@@ -61,6 +73,8 @@ SingleBrakepoint :: struct {
 DebuggerVariable :: struct {
     name: string,
     value: string,
+    address: uintptr, // where it lives in the debuggee (for read/write); 0 if not frame-relative
+    size: u32,        // byte size from its type (for set-variable writes)
 }
 
 ExportFunction :: struct {
@@ -286,6 +300,7 @@ runDebugProcess_Function :: proc(exePath: string) {
     stepStartFile: string // owned clone of the source file a step began from
     stepStartLine: u32 = 0
     stepStartSp: u64 = 0  // RSP when the step began; keeps step-over from stopping inside a callee
+    stepOutTarget: uintptr = 0 // for step-out: the caller's return address we're running to
 
     rearmAddress: uintptr = 0  // a hit breakpoint waiting to be single-stepped over and re-armed
     suppressPauseOnce := false // skip the source-line pause for the upcoming re-arm single-step
@@ -747,7 +762,44 @@ runDebugProcess_Function :: proc(exePath: string) {
         // The source-level stepping engine. While a step is in progress we drive it ourselves,
         // independent of the breakpoint/module-match path below, so we stay in control even
         // through library code that has no source info.
-        if stepMode != .None {
+        if stepMode == .Out {
+            // Step-out runs (at native speed) to the current function's return address, where we
+            // planted a one-shot breakpoint. We arrive here when it fired: the EXCEPTION_BREAKPOINT
+            // handler put RIP back onto stepOutTarget. RSP > stepStartSp confirms our own frame was
+            // actually popped, distinguishing the real return from a *nested* return to the same
+            // address when the function is recursive.
+            if addressToCheck == stepOutTarget && ctx.Rsp > stepStartSp {
+                inExe := exePdbValid && addressToCheck >= exeBaseAddress && addressToCheck < exeBaseAddress + uintptr(exeImageSize)
+                file: string
+                line: u32
+                if inExe {
+                    file, line, _, _ = getSourcePositionByRVA(exePdbData.session, u32(addressToCheck - exeBaseAddress))
+                }
+
+                windowData.currentDebuggerInstruction = SingleBrakepoint{ filePath = file, line = i32(line) }
+                if len(stepStartFile) > 0 { delete(stepStartFile) }
+                stepStartFile = ""
+                stepOutTarget = 0
+                stepMode = .None
+                stopDebugger = true
+            } else {
+                // Either we're starting the step-out, or a nested recursive return hit our breakpoint
+                // before our own frame returned. (Re)arm the return-address breakpoint and keep running.
+                armStepOut(processInfo.hProcess, threadHandler, &ctx, stepOutTarget, &tmpBreakpoints, &expectStepException, &continueStatus)
+                stopDebugger = false
+            }
+        } else if stepMode == .Instruction {
+            // We single-stepped exactly one machine instruction; stop here regardless of source line.
+            inExe := exePdbValid && addressToCheck >= exeBaseAddress && addressToCheck < exeBaseAddress + uintptr(exeImageSize)
+            file: string
+            line: u32
+            if inExe {
+                file, line, _, _ = getSourcePositionByRVA(exePdbData.session, u32(addressToCheck - exeBaseAddress))
+            }
+            windowData.currentDebuggerInstruction = SingleBrakepoint{ filePath = file, line = i32(line) }
+            stepMode = .None
+            stopDebugger = true
+        } else if stepMode != .None {
             // Only the exe carries source info, so only ask DIA when RIP is inside it (and avoid a
             // bogus RVA lookup while stepping through library code).
             inExe := exePdbValid && addressToCheck >= exeBaseAddress && addressToCheck < exeBaseAddress + uintptr(exeImageSize)
@@ -815,6 +867,8 @@ runDebugProcess_Function :: proc(exePath: string) {
         }
         if stopDebugger {
             collectDebuggerCallStack(processInfo.hProcess, threadHandler, ctx, modules[:])
+            sync.atomic_store(&windowData.debuggerStackPointer, u64(ctx.Rsp)) // default address for the memory viewer
+            windowData.debuggerRegisters = registersFromContext(ctx) // published before debuggerPaused below
         }
         // ctx.Rip
 
@@ -860,6 +914,70 @@ runDebugProcess_Function :: proc(exePath: string) {
                 stepMode = stepCommand == .STEP_OVER ? .Over : .Into
 
                 armStepMove(processInfo.hProcess, threadHandler, &ctx, stepMode, &tmpBreakpoints, &expectStepException, &continueStatus)
+                break
+            }
+
+            if stepCommand == .STEP_OUT {
+                sync.atomic_store(&windowData.debuggerCommand, .NONE)
+
+                // Find the caller's resume point (one unwind step) and run there at native speed via a
+                // one-shot breakpoint. The .Out branch of the stepping engine stops us when it fires.
+                target, targetOk := returnAddressOf(processInfo.hProcess, threadHandler, ctx, modules[:])
+                if targetOk {
+                    if len(stepStartFile) > 0 { delete(stepStartFile) }
+                    stepStartFile = "" // step-out stops on RSP, not a source-line compare
+                    stepStartSp = ctx.Rsp
+                    stepOutTarget = target
+                    stepMode = .Out
+                    armStepOut(processInfo.hProcess, threadHandler, &ctx, stepOutTarget, &tmpBreakpoints, &expectStepException, &continueStatus)
+                } else {
+                    // No caller to return to (outermost frame / no unwind info): fall back to continue.
+                    if rearmAddress != 0 {
+                        expectStepException = true
+                        suppressPauseOnce = true
+                        ctx.EFlags |= 0x100 // trap flag -> single step
+                        assert(win32.SetThreadContext(threadHandler, &ctx) == true)
+                        continueStatus = WIN32_DBG_CONTINUE
+                    }
+                }
+                break
+            }
+
+            if stepCommand == .STEP_INSTRUCTION {
+                sync.atomic_store(&windowData.debuggerCommand, .NONE)
+
+                // Single-step exactly one machine instruction. The .Instruction engine branch stops us
+                // on the resulting step event; the same event re-arms a hit breakpoint (rearmAddress).
+                stepMode = .Instruction
+                expectStepException = true
+                ctx.EFlags |= 0x100 // trap flag -> single step
+                assert(win32.SetThreadContext(threadHandler, &ctx) == true)
+                continueStatus = WIN32_DBG_CONTINUE
+                break
+            }
+
+            if stepCommand == .RUN_TO {
+                sync.atomic_store(&windowData.debuggerCommand, .NONE)
+
+                // Plant a one-shot breakpoint at the target line and run to it (or to an earlier user
+                // breakpoint). When it fires, RIP is in the exe so the module-match path below stops us.
+                if exePdbValid {
+                    rva := getRVABySourcePosition(exePdbData.session, windowData.debuggerRunToFile, windowData.debuggerRunToLine)
+                    if rva != 0 {
+                        target := exeBaseAddress + uintptr(rva)
+                        if target not_in tmpBreakpoints && target not_in appliedBreakpoints {
+                            applyBreakpoint(processInfo.hProcess, target, &tmpBreakpoints)
+                        }
+                    }
+                }
+                // Leave the current breakpoint by single-stepping off it first (re-arm), like CONTINUE.
+                if rearmAddress != 0 {
+                    expectStepException = true
+                    suppressPauseOnce = true
+                    ctx.EFlags |= 0x100 // trap flag -> single step
+                    assert(win32.SetThreadContext(threadHandler, &ctx) == true)
+                }
+                continueStatus = WIN32_DBG_CONTINUE
                 break
             }
 
@@ -931,6 +1049,25 @@ armStepMove :: proc(process: win32.HANDLE, threadHandler: win32.HANDLE, ctx: ^wi
     continueStatus^ = WIN32_DBG_CONTINUE
 }
 
+// Drives an in-progress step-out: we run at native speed to the current function's return address by
+// planting a one-shot breakpoint there. If a *nested* (recursive) return has left us sitting on that
+// address, single-step off it first so re-planting the breakpoint in place won't immediately retrigger
+// it. Called when the step-out starts and again after each return-address hit we decide to skip.
+armStepOut :: proc(process: win32.HANDLE, threadHandler: win32.HANDLE, ctx: ^win32.CONTEXT,
+    target: uintptr, tmpBreakpoints: ^map[uintptr]u8, expectStepException: ^bool, continueStatus: ^u32) {
+
+    if uintptr(ctx.Rip) == target {
+        // Sitting on the target (a skipped nested return): step one instruction off it; the engine
+        // re-plants the breakpoint on the resulting step event, when RIP no longer equals target.
+        expectStepException^ = true
+        ctx.EFlags |= 0x100 // trap flag -> single step
+        assert(win32.SetThreadContext(threadHandler, ctx) == true)
+    } else if target not_in tmpBreakpoints^ {
+        applyBreakpoint(process, target, tmpBreakpoints)
+    }
+    continueStatus^ = WIN32_DBG_CONTINUE
+}
+
 // Maps a CodeView (cvconst.h) AMD64 register id to the matching value in the thread context.
 registerValueById :: proc(ctx: win32.CONTEXT, registerId: win32.DWORD) -> u64 {
     // NOTE: cvconst.h CV_AMD64_* order is RAX,RBX,RCX,RDX,RSI,RDI,RBP,RSP — NOT the x86
@@ -987,8 +1124,10 @@ collectDebuggerLocals :: proc(process: win32.HANDLE, pdb: PdbData, baseAddress: 
         if pdb.session->findSymbolByRVA(rva, .SymTagFunction, &funcSym) == 0 && funcSym != nil {
             defer funcSym->Release()
 
+            // findChildren (non-Ex) returns E_INVALIDARG here, same as on the global scope, leaving the
+            // enum nil -> "no locals". findChildrenEx is the one that actually enumerates the children.
             enumSymbols: ^IDiaEnumSymbols
-            if funcSym->findChildren(.SymTagData, nil, 0, &enumSymbols) == 0 && enumSymbols != nil {
+            if funcSym->findChildrenEx(.SymTagData, nil, 0, &enumSymbols) == 0 && enumSymbols != nil {
                 defer enumSymbols->Release()
 
                 sym: ^IDiaSymbol
@@ -1008,21 +1147,29 @@ collectDebuggerLocals :: proc(process: win32.HANDLE, pdb: PdbData, baseAddress: 
 
                     nameBstr: win32.BSTR
                     if sym->get_name(&nameBstr) != 0 { continue }
-                    // wstring_to_utf8 already allocates an owned copy; it's freed later by
-                    // freeDebuggerLocalsContents, so store it directly (cloning would leak this one).
-                    name, _ := win32.wstring_to_utf8(win32.wstring(nameBstr), -1)
+                    // wstring_to_utf8 allocates via context.temp_allocator by default, so clone to the
+                    // heap. freeDebuggerLocalsContents delete()s this on the next collection; deleting a
+                    // temp pointer through the heap allocator is a bad free -> crash (see [[dia-helpers]]).
+                    nameTemp, _ := win32.wstring_to_utf8(win32.wstring(nameBstr), -1)
+                    name := strings.clone(nameTemp)
+
+                    // The variable's byte size comes from its type; without it we'd read 8 bytes and
+                    // show whatever adjacent stack bytes happen to follow a smaller variable.
+                    varSize: u64 = 0
+                    typeSym: ^IDiaSymbol
+                    if sym->get_type(&typeSym) == 0 && typeSym != nil {
+                        length: win32.ULONGLONG
+                        if typeSym->get_length(&length) == 0 { varSize = u64(length) }
+                        typeSym->Release()
+                    }
 
                     address := uintptr(i64(registerValueById(ctx, registerId)) + i64(offset))
 
-                    rawValue: u64
-                    read: uint
-                    win32.ReadProcessMemory(process, win32.LPCVOID(address), &rawValue, size_of(rawValue), &read)
-
-                    valueStr := fmt.aprintf("0x%X (%d)", rawValue, transmute(i64)rawValue) if read == size_of(rawValue) else strings.clone("<unreadable>")
-
                     append(&newLocals, DebuggerVariable{
                         name = name,
-                        value = valueStr,
+                        value = readDebuggerValue(process, address, varSize),
+                        address = address,
+                        size = u32(varSize),
                     })
                 }
             }
@@ -1034,6 +1181,83 @@ collectDebuggerLocals :: proc(process: win32.HANDLE, pdb: PdbData, baseAddress: 
     delete(windowData.debuggerLocals)
     windowData.debuggerLocals = newLocals
     sync.mutex_unlock(&windowData.debuggerLocalsMutex)
+}
+
+// Reads `byteSize` bytes (1..8) at `address` in the debuggee and formats them as "<dec> (0x<hex>)".
+// Using the real size avoids showing adjacent stack bytes, and lets small signed ints sign-extend.
+// Returns an owned (heap) string, freed later by freeDebuggerLocalsContents.
+readDebuggerValue :: proc(process: win32.HANDLE, address: uintptr, byteSize: u64) -> string {
+    size := byteSize
+    if size == 0 || size > 8 { size = 8 }
+
+    rawValue: u64
+    read: uint
+    if !win32.ReadProcessMemory(process, win32.LPCVOID(address), &rawValue, uint(size), &read) || read == 0 {
+        return strings.clone("<unreadable>")
+    }
+
+    effective := size
+    if u64(read) < effective { effective = u64(read) }
+
+    masked := rawValue
+    signed := i64(rawValue)
+    if effective < 8 {
+        bits := uint(effective) * 8
+        masked = rawValue & ((u64(1) << bits) - 1)
+        signed = i64(masked)
+        if masked & (u64(1) << (bits - 1)) != 0 { // sign bit set -> sign-extend
+            signed = i64(masked | ~((u64(1) << bits) - 1))
+        }
+    }
+
+    return fmt.aprintf("%d (0x%X)", signed, masked)
+}
+
+// Reads up to len(buffer) bytes from the debuggee at `address`. Returns how many were read and whether
+// any were (false if there's no live process or the region is unreadable). Used by the memory viewer,
+// the `x` command, and tests.
+readDebuggerMemory :: proc(address: uintptr, buffer: []u8) -> (uint, bool) {
+    process := windowData.debuggerProcessHandler
+    if process == nil || len(buffer) == 0 { return 0, false }
+
+    read: uint
+    if !win32.ReadProcessMemory(process, win32.LPCVOID(address), raw_data(buffer), uint(len(buffer)), &read) {
+        return 0, false
+    }
+    return read, read > 0
+}
+
+// Writes `data` into the debuggee at `address` (and flushes the instruction cache, in case it's code).
+// Returns true only if all bytes were written.
+writeDebuggerMemory :: proc(address: uintptr, data: []u8) -> bool {
+    process := windowData.debuggerProcessHandler
+    if process == nil || len(data) == 0 { return false }
+
+    written: uint
+    if !win32.WriteProcessMemory(process, win32.LPVOID(address), raw_data(data), uint(len(data)), &written) {
+        return false
+    }
+    FlushInstructionCache(process, win32.LPCVOID(address), uint(len(data)))
+    return written == uint(len(data))
+}
+
+// Writes the low `size` (1..8) bytes of `value` to `address` - i.e. sets an integer variable.
+writeDebuggerInt :: proc(address: uintptr, value: i64, size: int) -> bool {
+    n := size
+    if n <= 0 || n > 8 { n = 8 }
+    v := value
+    return writeDebuggerMemory(address, (cast([^]u8)&v)[:n])
+}
+
+// Snapshots the x64 general-purpose registers from a thread context.
+registersFromContext :: proc(ctx: win32.CONTEXT) -> DebuggerRegisters {
+    return {
+        rax = u64(ctx.Rax), rbx = u64(ctx.Rbx), rcx = u64(ctx.Rcx), rdx = u64(ctx.Rdx),
+        rsi = u64(ctx.Rsi), rdi = u64(ctx.Rdi), rbp = u64(ctx.Rbp), rsp = u64(ctx.Rsp),
+        r8 = u64(ctx.R8), r9 = u64(ctx.R9), r10 = u64(ctx.R10), r11 = u64(ctx.R11),
+        r12 = u64(ctx.R12), r13 = u64(ctx.R13), r14 = u64(ctx.R14), r15 = u64(ctx.R15),
+        rip = u64(ctx.Rip), rflags = u64(ctx.EFlags),
+    }
 }
 
 test :: proc() {

@@ -31,6 +31,25 @@ getFileLastMidifiedUnixTime :: proc(filePath: string) -> (unixTime: i64, exists:
     return win32.FILETIME_as_unix_nanoseconds(lpLastWriteTime), true
 }
 
+getFileSize :: proc(filePath: string) -> (size: i64, exists: bool) {
+    if !os.exists(filePath) {
+        return 0, false
+    }
+
+    hFile := win32.CreateFileW(win32.utf8_to_wstring(filePath), win32.GENERIC_READ, win32.FILE_SHARE_READ, nil, win32.OPEN_EXISTING, win32.FILE_ATTRIBUTE_NORMAL, nil)
+    if hFile == win32.INVALID_HANDLE_VALUE {
+        return 0, false
+    }
+    defer win32.CloseHandle(hFile)
+
+    fileSize: win32.LARGE_INTEGER
+    if !win32.GetFileSizeEx(hFile, &fileSize) {
+        return 0, false
+    }
+
+    return i64(fileSize), true
+}
+
 showOpenFileDialog :: proc(showOnlyFolders := false) -> (res: string, success: bool) {
     hr := win32.CoInitializeEx(nil, win32.COINIT(0x2 | 0x4))
     assert(hr == 0)
@@ -85,11 +104,48 @@ loadTextFile :: proc(filePath: string) -> string {
     originalFileText := string(fileContent[:])
 
     fileText, _ := strings.remove_all(originalFileText, "\r", context.temp_allocator)
-    
+
     return fileText
 }
 
+// Files larger than this are not fully loaded: only the first chunk is read and the
+// tab is opened read-only (see loadFileForTab). Keeps the editor responsive on huge
+// files (and avoids ever materialising a multi-hundred-MB editable buffer).
+MAX_FULL_LOAD_FILE_SIZE :: 10 * 1024 * 1024 // 10 MB
+
+// Reads a file for display in a tab. Small files are loaded whole and stay editable.
+// Files over MAX_FULL_LOAD_FILE_SIZE load only their first MAX_FULL_LOAD_FILE_SIZE
+// bytes and come back read-only, so the partial content can never be saved back over
+// the real file. Returned string is temp-allocated.
+loadFileForTab :: proc(filePath: string) -> (text: string, isReadOnly: bool) {
+    size, exists := getFileSize(filePath)
+    if !exists || size <= MAX_FULL_LOAD_FILE_SIZE {
+        return loadTextFile(filePath), false
+    }
+
+    handle, err := os.open(filePath)
+    if err != nil {
+        return loadTextFile(filePath), false
+    }
+    defer os.close(handle)
+
+    buffer := make([]byte, MAX_FULL_LOAD_FILE_SIZE, context.temp_allocator)
+    bytesRead, readErr := os.read(handle, buffer)
+    if readErr != nil {
+        return "", true
+    }
+
+    fileText, _ := strings.remove_all(string(buffer[:bytesRead]), "\r", context.temp_allocator)
+    return fileText, true
+}
+
 saveToOpenedFile :: proc(tab: ^FileTab) -> (success: bool) {
+    // Read-only tabs hold only the first chunk of a big file; writing it back would
+    // truncate the real file on disk, so never save them.
+    if tab.ctx != nil && tab.ctx.isReadOnly {
+        return false
+    }
+
     if len(tab.filePath) == 0 {
         showSaveAsFileDialog(tab)
     }
@@ -208,15 +264,21 @@ saveEditorState :: proc() {
     state.activeTabIndex = windowData.activeTabIndex
     state.debuggerExePath = windowData.debuggerExePath
 
-    // TODO: save only text copies of files that are relativelly small (less then 2k symbols)
     for tab in windowData.fileTabs {
+        // Only embed the buffer text when it can't be recovered from disk: untitled
+        // buffers (no path) or tabs with unsaved edits. For a saved, on-disk file we
+        // store an empty string and reload from the file on startup. Embedding every
+        // tab's full text used to bloat this file to ~half a GB (e.g. a 154 MB binary
+        // opened as a tab), so startup read + json.unmarshal'd hundreds of MB on every
+        // launch — see applyEditorState.
+        embedText := tab.filePath == "" || !tab.isSaved
         append(&state.fileTabs, SavedFileTab{
             name = tab.name,
             filePath = tab.filePath,
             isSaved = tab.isSaved,
             isPinned = tab.isPinned,
             lastUpdatedAt = tab.lastUpdatedAt,
-            text = strings.to_string(tab.ctx.text),
+            text = embedText ? strings.to_string(tab.ctx.text) : "",
             textSelection = tab.ctx.editorState.selection,
             lineIndex = tab.ctx.lineIndex,
         })
@@ -234,21 +296,40 @@ applyEditorState :: proc() -> bool {
     fileContent, err := os.read_entire_file_or_err(editorStateFilePath)
     defer delete(fileContent)
 
-    if err == os.General_Error.Not_Exist {
+    // No saved state (first run) or it can't be read: start fresh, don't crash.
+    if err != nil {
         return false
     }
-    assert(err == nil)
 
     state: EditorState
     unmarshalErr := json.unmarshal(fileContent, &state, allocator = context.temp_allocator)
+    defer delete(state.fileTabs)
 
-    assert(unmarshalErr == nil)
+    // A corrupt or oversized state file would otherwise assert-crash here; degrade
+    // to a fresh session instead.
+    if unmarshalErr != nil {
+        return false
+    }
 
     for tab in state.fileTabs {
-        ctx := createEmptyTextContext(tab.text)
+        text := tab.text
+        isReadOnly := false
+
+        // Text wasn't embedded (a saved, on-disk file) — reload it from disk. Big
+        // files come back partially loaded and read-only so startup stays fast and we
+        // never lay out a multi-hundred-MB buffer before the first frame.
+        if len(text) == 0 && len(tab.filePath) > 0 {
+            if _, exists := getFileSize(tab.filePath); !exists {
+                continue // file is gone — drop the tab
+            }
+            text, isReadOnly = loadFileForTab(tab.filePath)
+        }
+
+        ctx := createEmptyTextContext(text)
+        ctx.isReadOnly = isReadOnly
         ctx.editorState.selection = tab.textSelection
         ctx.lineIndex = tab.lineIndex
-        
+
         append(&windowData.fileTabs, FileTab{
             name = strings.clone(tab.name),
             ctx = ctx,
@@ -257,15 +338,17 @@ applyEditorState :: proc() -> bool {
             isPinned = tab.isPinned,
             lastUpdatedAt = tab.lastUpdatedAt,
         })
-        // delete(tab.text)
     }
-    defer delete(state.fileTabs)
+
+    if len(windowData.fileTabs) == 0 {
+        return false // nothing restored — caller adds an empty tab
+    }
 
     if len(state.openedFolder) > 0 {
         showExplorer(strings.clone(state.openedFolder))
     }
 
-    windowData.activeTabIndex = state.activeTabIndex
+    windowData.activeTabIndex = clamp(state.activeTabIndex, 0, len(windowData.fileTabs) - 1)
 
     if len(state.debuggerExePath) > 0 {
         windowData.debuggerExePath = strings.clone(state.debuggerExePath)

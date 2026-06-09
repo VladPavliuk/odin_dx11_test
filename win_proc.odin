@@ -125,14 +125,22 @@ winProc :: proc "system" (hwnd: win32.HWND, msg: win32.UINT, wParam: win32.WPARA
         win32.DragFinish(hDrop)
     case win32.WM_KEYDOWN:
         handle_WM_KEYDOWN(lParam, wParam)
+    case win32.WM_SYSKEYDOWN:
+        // F10 is the Windows "menu" key and arrives here, NOT as WM_KEYDOWN. If it reaches
+        // DefWindowProc it activates the (non-existent) window menu and the app appears frozen in a
+        // modal menu loop. Capture F10 ourselves and swallow it. Other system keys (e.g. Alt+F4 ->
+        // SC_CLOSE) still fall through to DefWindowProc below.
+        if wParam == win32.VK_F10 {
+            handle_WM_KEYDOWN(lParam, wParam)
+            return 0
+        }
     case win32.WM_CHAR:
-        if windowData.wasInputSymbolTyped && windowData.isInputMode {
-            if windowData.editableTextCtx != nil {
-                edit.input_rune(&windowData.editableTextCtx.editorState, rune(wParam))
-            }
+        if windowData.wasInputSymbolTyped && windowData.isInputMode &&
+           windowData.editableTextCtx != nil && !windowData.editableTextCtx.isReadOnly {
+            edit.input_rune(&windowData.editableTextCtx.editorState, rune(wParam))
             if isActiveTabContext() { getActiveTab().isSaved = false }
             windowData.wasTextContextModified = true
-            
+
             calculateLines(windowData.editableTextCtx)
             updateCusrorData(windowData.editableTextCtx)
             jumpToCursor(windowData.editableTextCtx)
@@ -147,6 +155,11 @@ winProc :: proc "system" (hwnd: win32.HWND, msg: win32.UINT, wParam: win32.WPARA
             tryCloseEditor()
             return 0
         }
+        // The editor has no native menu, so swallow Alt/F10 menu activation - otherwise the window
+        // enters a modal menu loop and looks frozen until Esc/Alt is pressed.
+        if (wParam & 0xFFF0) == 0xF100 { // SC_KEYMENU
+            return 0
+        }
     case win32.WM_SETFOCUS:
         // check all tabs, where any file changed
 
@@ -156,7 +169,11 @@ winProc :: proc "system" (hwnd: win32.HWND, msg: win32.UINT, wParam: win32.WPARA
         win32.PostQuitMessage(0)
     }
 
-    return win32.DefWindowProcA(hwnd, msg, wParam, lParam)
+    // NOTE: must be the W (Unicode) variant — the window is created via
+    // RegisterClassExW/CreateWindowExW. Using DefWindowProcA made the default
+    // WM_NCCREATE/WM_SETTEXT handling read the wide title L"Editor" as an ANSI
+    // string, which stops at the first 0x00 byte -> the title became just "E".
+    return win32.DefWindowProcW(hwnd, msg, wParam, lParam)
 }
 
 // @(private="file") 
@@ -229,9 +246,12 @@ handle_WM_KEYDOWN :: proc(lParam: win32.LPARAM, wParam: win32.WPARAM) {
     }
 
     editorCtx := windowData.editableTextCtx
+    // Read-only tabs (big files in preview mode) allow navigation/selection/copy but
+    // block anything that mutates the buffer.
+    canModify := editorCtx != nil && !editorCtx.isReadOnly
     switch wParam {
     case win32.VK_RETURN:
-        if editorCtx == nil || editorCtx.disableNewLines { break }
+        if editorCtx == nil || editorCtx.disableNewLines || !canModify { break }
         
         // NOTE: if there's any whitespace at the beginning of the line, copy it to the new line
         lineStart := editorCtx.editorState.line_start
@@ -259,10 +279,8 @@ handle_WM_KEYDOWN :: proc(lParam: win32.LPARAM, wParam: win32.WPARAM) {
             } else {
                 moveToNextTab()
             }
-        } else {
-            if windowData.editableTextCtx != nil {
-                edit.input_rune(&editorCtx.editorState, rune('\t'))
-            }
+        } else if canModify {
+            edit.input_rune(&editorCtx.editorState, rune('\t'))
             if isActiveTabContext() { getActiveTab().isSaved = false }
             windowData.wasTextContextModified = true
         }
@@ -307,6 +325,7 @@ handle_WM_KEYDOWN :: proc(lParam: win32.LPARAM, wParam: win32.WPARAM) {
             edit.move_to(&editorCtx.editorState, edit.Translation.Down)
         }
     case win32.VK_BACK:
+        if !canModify { break }
         if isCtrlPressed() {
             edit.perform_command(&editorCtx.editorState, edit.Command.Delete_Word_Left)
         } else {
@@ -314,7 +333,8 @@ handle_WM_KEYDOWN :: proc(lParam: win32.LPARAM, wParam: win32.WPARAM) {
         }
         if isActiveTabContext() { getActiveTab().isSaved = false }
         windowData.wasTextContextModified = true
-    case win32.VK_DELETE:        
+    case win32.VK_DELETE:
+        if !canModify { break }
         if isCtrlPressed() {
             edit.perform_command(&editorCtx.editorState, edit.Command.Delete_Word_Right)
         } else {
@@ -345,11 +365,13 @@ handle_WM_KEYDOWN :: proc(lParam: win32.LPARAM, wParam: win32.WPARAM) {
             edit.perform_command(&editorCtx.editorState, edit.Command.Copy)
         }
     case win32.VK_V:
+        if !canModify { break }
         edit.perform_command(&editorCtx.editorState, edit.Command.Paste)
-        
+
         if isActiveTabContext() { getActiveTab().isSaved = false }
         windowData.wasTextContextModified = true
     case win32.VK_X:
+        if !canModify { break }
         // NOTE: if no text selection, copy current line
         if !edit.has_selection(&editorCtx.editorState) {
             line := editorCtx.lines[editorCtx.cursorLineIndex]
@@ -365,6 +387,7 @@ handle_WM_KEYDOWN :: proc(lParam: win32.LPARAM, wParam: win32.WPARAM) {
         if isActiveTabContext() { getActiveTab().isSaved = false }
         windowData.wasTextContextModified = true
     case win32.VK_Z:
+        if !canModify { break }
         if isShiftPressed() {
             edit.perform_command(&editorCtx.editorState, edit.Command.Redo)
         } else {

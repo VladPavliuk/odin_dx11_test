@@ -40,12 +40,18 @@ EditableTextContext :: struct {
 
     editorState: edit.State,
     disableNewLines: bool,
+    isReadOnly: bool, // true for big files opened in preview mode (see loadFileForTab) — blocks all edits/saves
     maxLineWidth: f32,
 
     lineIndex: f32, // top line index from which text is rendered, it's float since we want to have behaviour when only part of a line is visible (for smooth scrolling)
     cursorLineIndex: i32,
     cursorLeftOffset: f32, // offset from line start
     lines: [dynamic]int2,
+
+    // Snapshot of the text/rect at the last layout, used to relayout only the changed
+    // region on the next edit instead of rescanning the whole document (see calculateLines).
+    prevText: [dynamic]u8,
+    prevRectWidth: i32,
 
     glyphsLocations: map[i32]GlyphsLocation,
 
@@ -110,6 +116,9 @@ WindowData :: struct {
 
     autoSaveStateInterval: f64,
     sinceAutoSaveState: f64,
+
+    fileModifiedCheckInterval: f64, // how often to stat the active file for external changes
+    sinceFileModifiedCheck: f64,
     //<
 
     //> debugger
@@ -125,6 +134,14 @@ WindowData :: struct {
     debuggerCallStack: [dynamic]DebuggerStackFrame, // call stack snapshot at the current stop
     debuggerCallStackMutex: sync.Mutex, // guards debuggerCallStack (written by the debug thread, read by render)
     debuggerPaused: bool, // set by the debug thread while it's stopped waiting for a command (used by the cmd debugger to detect stops)
+    debugPanelHeight: i32, // height of the bottom debug panel; non-zero only while a session is active (reserves editor space)
+    debuggerStackPointer: u64, // RSP captured at the last stop; the default address the memory viewer follows
+    debuggerMemoryAddress: u64, // explicit address shown in the memory viewer (0 = follow the stack pointer)
+    debuggerMemoryAddressInput: strings.Builder, // editable hex text backing the memory viewer's address field
+    debugPanelForceVisible: bool, // test/preview hook: render the debug panel even without a live session
+    debuggerRegisters: DebuggerRegisters, // x64 GP registers captured at the last stop
+    debuggerRunToFile: string, // target for the .RUN_TO command (set by the front-end before issuing it)
+    debuggerRunToLine: i32,
     //<
 }
 
@@ -163,7 +180,7 @@ createWindow :: proc(size: int2) {
     // TODO: is it good approach?
     win32.SetProcessDpiAwarenessContext(win32.DPI_AWARENESS_CONTEXT_SYSTEM_AWARE)
     
-    windowTitle := "Editor"
+    windowTitle := "Edi the Editor"
     
     // rect: win32.RECT = {0, 0, size.x, size.y}
     // win32.AdjustWindowRect(&rect, win32.WS_OVERLAPPEDWINDOW, true)
@@ -220,6 +237,7 @@ createWindow :: proc(size: int2) {
 
     windowData.explorerSyncInterval = 0.3
     windowData.autoSaveStateInterval = 5.0
+    windowData.fileModifiedCheckInterval = 0.5
     //<
 
     windowData.uiContext.getTextWidth = getTextWidth
@@ -238,6 +256,7 @@ createWindow :: proc(size: int2) {
     }
 
     windowData.fileSearchStr = strings.builder_make()
+    windowData.debuggerMemoryAddressInput = strings.builder_make()
 
     // TODO: testing
     windowData.uiTextInputCtx.text = strings.builder_make()
@@ -273,6 +292,7 @@ removeWindowData :: proc() {
     
     freeTextContext(&windowData.uiTextInputCtx, false)
     strings.builder_destroy(&windowData.fileSearchStr)
+    strings.builder_destroy(&windowData.debuggerMemoryAddressInput)
     
     ui.clearContext(&windowData.uiContext)
     // NOTE: lines/editorState/text are already freed by freeTextContext above; don't free them again.
@@ -292,7 +312,7 @@ removeWindowData :: proc() {
 getEditorSize :: proc() -> int2 {
     return {
         windowData.size.x - windowData.editorPadding.left - windowData.editorPadding.right,
-        windowData.size.y - windowData.editorPadding.top - windowData.editorPadding.bottom,
+        windowData.size.y - windowData.editorPadding.top - windowData.editorPadding.bottom - windowData.debugPanelHeight,
     }
 }
 
